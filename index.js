@@ -114,7 +114,7 @@ bot.on('message', async (msg) => {
             console.error(err);
             return bot.sendMessage(chatId, "❌ Erro ao atualizar o banco de dados.");
         }
-    }
+
         }
     }
 
