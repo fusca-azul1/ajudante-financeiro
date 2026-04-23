@@ -92,26 +92,29 @@ bot.on('message', async (msg) => {
     await pool.query('INSERT INTO usuarios (telegram_id, username) VALUES ($1, $2) ON CONFLICT (telegram_id) DO UPDATE SET username = $2', [userId, msg.from.username || 'Usuario']);
 
     // --- COMANDO DE ADMIN: /vip ---
+    // --- COMANDO DE ADMIN: /vip (VERSÃO MELHORADA) ---
     if (text.startsWith('/vip')) {
-        const seuIdDono = 7255640135; // <--- O SEU ID ESTÁ AQUI
+        const seuIdDono = 7255640135; 
 
         if (userId !== seuIdDono) {
             return bot.sendMessage(chatId, "❌ Comando restrito ao administrador.");
         }
 
-        const partes = text.split(' ');
-        const idParaPromover = partes[1];
+        // Isso limpa espaços extras e pega apenas o número
+        const idParaPromover = text.replace('/vip', '').trim();
 
-        if (!idParaPromover) {
-            return bot.sendMessage(chatId, "⚠️ Use: <code>/vip ID_DO_USUARIO</code>", { parse_mode: 'HTML' });
+        if (!idParaPromover || isNaN(idParaPromover)) {
+            return bot.sendMessage(chatId, `⚠️ <b>Uso correto:</b>\n<code>/vip 12345678</code>`, { parse_mode: 'HTML' });
         }
 
         try {
             await pool.query("UPDATE usuarios SET plano = 'VIP' WHERE telegram_id = $1", [idParaPromover]);
-            return bot.sendMessage(chatId, `⭐ O usuário <code>${idParaPromover}</code> agora é <b>VIP/PRO</b> e tem acesso ilimitado!`, { parse_mode: 'HTML' });
+            return bot.sendMessage(chatId, `⭐ O usuário <code>${idParaPromover}</code> agora é <b>VIP/PRO</b>!`, { parse_mode: 'HTML' });
         } catch (err) {
             console.error(err);
             return bot.sendMessage(chatId, "❌ Erro ao atualizar o banco de dados.");
+        }
+    }
         }
     }
 
