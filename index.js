@@ -91,8 +91,7 @@ bot.on('message', async (msg) => {
     // Registrar usuário se não existir
     await pool.query('INSERT INTO usuarios (telegram_id, username) VALUES ($1, $2) ON CONFLICT (telegram_id) DO UPDATE SET username = $2', [userId, msg.from.username || 'Usuario']);
 
-    // --- COMANDO DE ADMIN: /vip ---
-    // --- COMANDO DE ADMIN: /vip (VERSÃO MELHORADA) ---
+    // --- COMANDO DE ADMIN: /vip (VERSÃO CORRIGIDA) ---
     if (text.startsWith('/vip')) {
         const seuIdDono = 7255640135; 
 
@@ -100,7 +99,6 @@ bot.on('message', async (msg) => {
             return bot.sendMessage(chatId, "❌ Comando restrito ao administrador.");
         }
 
-        // Isso limpa espaços extras e pega apenas o número
         const idParaPromover = text.replace('/vip', '').trim();
 
         if (!idParaPromover || isNaN(idParaPromover)) {
@@ -113,8 +111,6 @@ bot.on('message', async (msg) => {
         } catch (err) {
             console.error(err);
             return bot.sendMessage(chatId, "❌ Erro ao atualizar o banco de dados.");
-        }
-
         }
     }
 
@@ -162,7 +158,7 @@ bot.on('message', async (msg) => {
         if (text === '📊 Gráfico') return enviarGraficoCompleto(chatId, userId);
         if (text === '📄 Relatório') return enviarRelatorio(chatId, userId);
 
-        // RESPOSTA PADRÃO (FALLBACK) - Impede que o bot fique mudo
+        // RESPOSTA PADRÃO (FALLBACK)
         return bot.sendMessage(chatId, "🤖 Ops, não entendi! Por favor, use os botões do menu abaixo para conversarmos:", menuPrincipal);
     }
 
@@ -189,7 +185,7 @@ bot.on('message', async (msg) => {
         
         const emoji = estado.tipo === 'entrada' ? '🟢' : '🔴';
         bot.sendMessage(chatId, `${emoji} Sucesso! Lançamento de <b>R$${estado.valor.toFixed(2)}</b> (${text}) foi salvo!`, { parse_mode: 'HTML', ...menuPrincipal });
-        delete estados[userId]; // Limpa o estado para voltar ao menu
+        delete estados[userId]; 
     }
 });
 
