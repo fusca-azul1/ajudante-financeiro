@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const QuickChart = require('quickchart-js');
 const { Pool } = require('pg');
-const ExcelJS = require('exceljs'); // Para gerar a planilha
+const ExcelJS = require('exceljs');
 const fs = require('fs');
 
 const token = process.env.BOT_TOKEN;
@@ -36,14 +36,14 @@ async function setupDB() {
                 data TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("✅ Banco conectado com Gestão de Planilha.");
+        console.log("✅ Banco conectado e sincronizado.");
     } catch (err) {
         console.error("❌ Erro ao conectar ao banco:", err);
     }
 }
 setupDB();
 
-const ID_DONO = 7255640135; // Seu ID de administrador
+const ID_DONO = 7255640135; 
 const estados = {};
 
 // --- INTERFACE ---
@@ -113,19 +113,20 @@ bot.on('message', async (msg) => {
             } catch (e) { return bot.sendMessage(chatId, "❌ Erro no banco."); }
         }
 
-        // COMANDO: /vips (Lista em texto)
+        // COMANDO: /vips (CORREÇÃO DA DATA 1970)
         if (text === '/vips') {
             const res = await pool.query("SELECT telegram_id, username, vip_expiracao FROM usuarios WHERE plano = 'VIP' ORDER BY vip_expiracao ASC");
             if (res.rowCount === 0) return bot.sendMessage(chatId, "Nenhum VIP ativo no momento.");
+            
             let lista = "📋 <b>CLIENTES VIP ATIVOS:</b>\n\n";
             res.rows.forEach(u => {
-                const data = new Date(u.vip_expiracao).toLocaleDateString('pt-BR');
-                lista += `👤 @${u.username || 'S/N'} (<code>${u.telegram_id}</code>)\n📅 Vence em: ${data}\n\n`;
+                const dataExp = u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleDateString('pt-BR') : "Data não definida";
+                lista += `👤 @${u.username || 'Sem Username'} (<code>${u.telegram_id}</code>)\n📅 Vence em: <b>${dataExp}</b>\n\n`;
             });
             return bot.sendMessage(chatId, lista, { parse_mode: 'HTML' });
         }
 
-        // COMANDO: /planilha_vips (Gera Excel)
+        // COMANDO: /planilha_vips (CORREÇÃO COLUNA EXPIRAÇÃO)
         if (text === '/planilha_vips') {
             const res = await pool.query("SELECT telegram_id, username, plano, vip_expiracao, data_cadastro FROM usuarios WHERE plano = 'VIP'");
             
@@ -139,22 +140,23 @@ bot.on('message', async (msg) => {
                 { header: 'Cadastrado em', key: 'cadastro', width: 25 }
             ];
 
-            res.rows.forEach(u => worksheet.addRow({
-                id: String(u.telegram_id),
-                user: u.username || 'N/A',
-                plano: u.plano,
-                expira: u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleString('pt-BR') : '-',
-                cadastro: new Date(u.data_cadastro).toLocaleString('pt-BR')
-            }));
+            res.rows.forEach(u => {
+                worksheet.addRow({
+                    id: String(u.telegram_id),
+                    user: u.username || 'N/A',
+                    plano: u.plano,
+                    expira: u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleString('pt-BR') : 'Expirado/Sem Data',
+                    cadastro: u.data_cadastro ? new Date(u.data_cadastro).toLocaleString('pt-BR') : '-'
+                });
+            });
 
             const filePath = './VIPS_Financeiro.xlsx';
             await workbook.xlsx.writeFile(filePath);
-            await bot.sendDocument(chatId, filePath, { caption: "📊 Aqui está sua planilha de controle VIP." });
-            return fs.unlinkSync(filePath); // Apaga o arquivo temporário
+            await bot.sendDocument(chatId, filePath, { caption: "📊 Planilha de controle VIP atualizada." });
+            return fs.unlinkSync(filePath);
         }
     }
 
-    // --- RESTANTE DO CÓDIGO (START, GANHEI, GASTEI, ETC) ---
     if (text === '/start' || text === '⬅️ Voltar') {
         delete estados[userId];
         return bot.sendMessage(chatId, "<b>Financeiro Pro 🚀</b>\nEscolha uma opção:", { parse_mode: 'HTML', ...menuPrincipal });
@@ -168,7 +170,13 @@ bot.on('message', async (msg) => {
         const res = await pool.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [userId]);
         const count = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
         const user = res.rows[0];
-        let exp = (user?.plano === 'VIP' && user.vip_expiracao) ? `\n📅 Expira: <b>${new Date(user.vip_expiracao).toLocaleDateString('pt-BR')}</b>` : "";
+        
+        let exp = "";
+        if (user?.plano === 'VIP' && user.vip_expiracao) {
+            const d = new Date(user.vip_expiracao);
+            exp = `\n📅 Expira: <b>${d.toLocaleDateString('pt-BR')} às ${d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute:'2-digit'})}</b>`;
+        }
+
         return bot.sendMessage(chatId, `👤 <b>Perfil</b>\nID: <code>${userId}</code>\nPlano: <b>${user?.plano || 'FREE'}</b>${exp}\nRegistros: ${count.rows[0].total}`, { parse_mode: 'HTML' });
     }
 
@@ -199,7 +207,6 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- FUNÇÕES DE APOIO ---
 async function enviarGraficoCompleto(chatId, userId) {
     const res = await pool.query("SELECT tipo, SUM(valor) as total FROM transacoes WHERE user_id = $1 GROUP BY tipo", [userId]);
     if (res.rowCount === 0) return bot.sendMessage(chatId, "Sem dados.");
