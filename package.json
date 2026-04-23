@@ -1,0 +1,16 @@
+{
+  "name": "bot-financeiro",
+  "version": "1.0.0",
+  "description": "Bot financeiro pessoal com metas, alertas e gráficos",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^4.22.1",
+    "node-telegram-bot-api": "^0.67.0",
+    "pg": "^8.20.0",
+    "quickchart-js": "^3.1.3"
+  }
+}

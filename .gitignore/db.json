@@ -1,0 +1,60 @@
+{
+  "users": {
+    "7255640135": {
+      "transacoes": [
+        {
+          "tipo": "entrada",
+          "categoria": "💼 Salário/Fixo",
+          "valor": 2000,
+          "descricao": "venda",
+          "data": "2026-04-22T04:06:07.328Z"
+        },
+        {
+          "tipo": "saida",
+          "categoria": "🛒 Variável",
+          "valor": 50,
+          "descricao": "uber",
+          "data": "2026-04-22T04:06:18.865Z"
+        },
+        {
+          "tipo": "entrada",
+          "categoria": "💼 Salário/Fixo",
+          "valor": 2000,
+          "descricao": "salário",
+          "data": "2026-04-22T04:11:52.209Z"
+        },
+        {
+          "tipo": "saida",
+          "categoria": "🏠 Fixo",
+          "valor": 200,
+          "descricao": "uber",
+          "data": "2026-04-22T04:12:33.545Z"
+        },
+        {
+          "tipo": "entrada",
+          "categoria": "💼 Salário/Fixo",
+          "valor": 3000,
+          "descricao": "salario",
+          "data": "2026-04-22T22:40:38.234Z"
+        }
+      ],
+      "investimentos": [
+        {
+          "valor": 100,
+          "destino": "imovel",
+          "data": "2026-04-22T04:06:40.880Z"
+        },
+        {
+          "valor": 100,
+          "destino": "cripto",
+          "data": "2026-04-22T04:13:33.379Z"
+        },
+        {
+          "valor": 100,
+          "destino": "imoveis",
+          "data": "2026-04-22T22:46:21.656Z"
+        }
+      ]
+    }
+  }
+}
