@@ -199,7 +199,7 @@ bot.on('message', async (msg) => {
             `Assine por apenas <b>R$ 5,00/mês</b> para ter registros ilimitados e não perder seu histórico!\n\n` +
             `📷 Acesse o QR Code aqui: ${linkQrCode}\n\n` +
             `🔑 <b>PIX Copia e Cola:</b> <code>${chavePix}</code>\n\n` +
-            `✅ Após o pagamento, envie o comprovante para @fusca_azul1 para liberação imediata.`;
+            `✅ Após o pagamento, envie o comprovante junto com seu id localizado em seu perfil para @fusca_azul1 para liberação imediata.`;
 
         return bot.sendMessage(chatId, msgVip, { parse_mode: 'HTML' });
     }
