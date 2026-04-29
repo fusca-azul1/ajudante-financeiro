@@ -36,7 +36,7 @@ async function setupDB() {
                 data TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("✅ Banco conectado: Gestão de Investimentos, QR Code e VIP 2.0 ativados.");
+        console.log("✅ Banco conectado: Gestão de Investimentos e VIP 2.0 ativados.");
     } catch (err) {
         console.error("❌ Erro ao conectar ao banco:", err);
     }
@@ -75,7 +75,7 @@ async function verificarAcesso(userId) {
         }
     }
 
-    // Regra do FREE: Máximo 15 registros. Se o VIP venceu e ele tem > 15, tranca o bot.
+    // Regra do FREE: Máximo 15 registros.
     const contagem = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
     const totalRegistros = parseInt(contagem.rows[0].total);
     
@@ -104,13 +104,26 @@ bot.on('message', async (msg) => {
 
     await pool.query('INSERT INTO usuarios (telegram_id, username) VALUES ($1, $2) ON CONFLICT (telegram_id) DO UPDATE SET username = $2', [userId, msg.from.username || 'Usuario']);
 
-    // --- COMANDO /CLEAN (ZERAR HISTÓRICO) ---
+    // --- COMANDO /CLEAN (ZERAR HISTÓRICO DO USUÁRIO) ---
     if (text === '/clean') {
         try {
             await pool.query("DELETE FROM transacoes WHERE user_id = $1", [userId]);
             return bot.sendMessage(chatId, "🗑️ <b>Histórico limpo!</b> Todos os seus registros foram apagados com sucesso.", { parse_mode: 'HTML' });
         } catch (e) {
             return bot.sendMessage(chatId, "❌ Erro ao limpar histórico.");
+        }
+    }
+
+    // --- COMANDO /CLS (ZERAR TODO O BANCO DE DADOS - SÓ O DONO) ---
+    if (text === '/cls') {
+        if (userId !== ID_DONO) {
+            return bot.sendMessage(chatId, "❌ Apenas o dono pode utilizar este comando.");
+        }
+        try {
+            await pool.query("TRUNCATE TABLE transacoes, usuarios RESTART IDENTITY CASCADE;");
+            return bot.sendMessage(chatId, "⚠️ <b>BANCO DE DADOS TOTALMENTE ZERADO!</b>\nTodos os usuários, VIPs e registros financeiros foram apagados permanentemente.", { parse_mode: 'HTML' });
+        } catch (e) {
+            return bot.sendMessage(chatId, "❌ Erro ao limpar o banco de dados geral.");
         }
     }
 
@@ -177,22 +190,21 @@ bot.on('message', async (msg) => {
         return bot.sendMessage(chatId, "<b>Financeiro Pro 🚀</b>\nEscolha uma opção no menu abaixo:", { parse_mode: 'HTML', ...menuPrincipal });
     }
 
-    // --- MENSAGEM VIP COM QR CODE (R$ 5,00) ---
+    // --- MENSAGEM VIP (LINK NO LUGAR DO QR CODE) ---
     if (text === '💎 Plano VIP') {
         const chavePix = 'd6e581ca-196b-4c5b-a4d4-33947695144e';
-        // Gerador de QR Code através de API gratuita:
-        const qrUrl = `https://quickchart.io/qr?text=${chavePix}&size=300&margin=2`;
+        const linkQrCode = 'COLOQUE_SEU_LINK_AQUI'; // <--- INSIRA O LINK DA SUA IMAGEM/CÓDIGO AQUI
         
         const msgVip = `👑 <b>MODO VIP ILIMITADO</b>\n\n` +
             `Assine por apenas <b>R$ 5,00/mês</b> para ter registros ilimitados e não perder seu histórico!\n\n` +
-            `📷 Escaneie o <b>QR Code</b> acima no app do seu banco ou utilize o Pix Copia e Cola abaixo:\n\n` +
+            `📷 Acesse o QR Code aqui: ${linkQrCode}\n\n` +
             `🔑 <b>PIX Copia e Cola:</b> <code>${chavePix}</code>\n\n` +
             `✅ Após o pagamento, envie o comprovante para @fusca_azul1 para liberação imediata.`;
 
-        return bot.sendPhoto(chatId, qrUrl, { caption: msgVip, parse_mode: 'HTML' });
+        return bot.sendMessage(chatId, msgVip, { parse_mode: 'HTML' });
     }
 
-    // --- PERFIL COM DATA EXATA DE EXPIRAÇÃO ---
+    // --- PERFIL (COM MENSAGEM DE EXPIRAÇÃO NO FINAL) ---
     if (text === '👤 Perfil') {
         const res = await pool.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [userId]);
         const count = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
@@ -201,10 +213,14 @@ bot.on('message', async (msg) => {
         let exp = "";
         if (user?.plano === 'VIP' && user.vip_expiracao) {
             const d = new Date(user.vip_expiracao);
-            exp = `\n📅 Expira em: <b>${d.toLocaleDateString('pt-BR')} às ${d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute:'2-digit'})}</b>`;
+            const dia = String(d.getDate()).padStart(2, '0');
+            const mes = String(d.getMonth() + 1).padStart(2, '0');
+            const ano = d.getFullYear();
+            
+            exp = `\n\nSeu vip expira dia (${dia}/${mes}/${ano})`;
         }
 
-        return bot.sendMessage(chatId, `👤 <b>Perfil</b>\n\nID: <code>${userId}</code>\nPlano: <b>${user?.plano || 'FREE'}</b>${exp}\nTotal de Registros: <b>${count.rows[0].total}</b>`, { parse_mode: 'HTML' });
+        return bot.sendMessage(chatId, `👤 <b>Perfil</b>\n\nID: <code>${userId}</code>\nPlano: <b>${user?.plano || 'FREE'}</b>\nTotal de Registros: <b>${count.rows[0].total}</b>${exp}`, { parse_mode: 'HTML' });
     }
 
     const estado = estados[userId];
@@ -274,7 +290,7 @@ async function enviarGraficoCompleto(chatId, userId) {
     });
 
     const saldoDisponivel = gn - gs - inv;
-    const patrimonioTotal = gn - gs; // Saldo + Investimentos
+    const patrimonioTotal = gn - gs; 
 
     const chart = new QuickChart();
     chart.setConfig({ 
