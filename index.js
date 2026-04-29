@@ -193,7 +193,7 @@ bot.on('message', async (msg) => {
     // --- MENSAGEM VIP (LINK NO LUGAR DO QR CODE) ---
     if (text === '💎 Plano VIP') {
         const chavePix = 'd6e581ca-196b-4c5b-a4d4-33947695144e';
-        const linkQrCode = 'COLOQUE_SEU_LINK_AQUI'; // <--- INSIRA O LINK DA SUA IMAGEM/CÓDIGO AQUI
+        const linkQrCode = 'https://nubank.com.br/cobrar/ckgfui/69f15cc6-a283-4731-a46c-78da2c9b0bd3'; // <--- INSIRA O LINK DA SUA IMAGEM/CÓDIGO AQUI
         
         const msgVip = `👑 <b>MODO VIP ILIMITADO</b>\n\n` +
             `Assine por apenas <b>R$ 5,00/mês</b> para ter registros ilimitados e não perder seu histórico!\n\n` +
