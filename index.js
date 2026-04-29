@@ -36,7 +36,7 @@ async function setupDB() {
                 data TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("✅ Banco conectado e sincronizado.");
+        console.log("✅ Banco conectado: Gestão de Investimentos, QR Code e VIP 2.0 ativados.");
     } catch (err) {
         console.error("❌ Erro ao conectar ao banco:", err);
     }
@@ -46,10 +46,10 @@ setupDB();
 const ID_DONO = 7255640135; 
 const estados = {};
 
-// --- INTERFACE ---
+// --- INTERFACE (MENU ATUALIZADO) ---
 const menuPrincipal = {
     reply_markup: {
-        keyboard: [['💰 Ganhei', '💸 Gastei'], ['📊 Gráfico', '📄 Relatório'], ['💎 Plano VIP', '👤 Perfil']],
+        keyboard: [['💰 Ganhei', '💸 Gastei', '📈 Investi'], ['📊 Gráfico', '📄 Relatório'], ['💎 Plano VIP', '👤 Perfil']],
         resize_keyboard: true
     }
 };
@@ -58,25 +58,32 @@ const tecladoVoltar = {
     reply_markup: { keyboard: [['⬅️ Voltar']], resize_keyboard: true }
 };
 
-// --- FUNÇÃO DE LIMITE ---
+// --- FUNÇÃO DE LIMITE E BLOQUEIO ---
 async function verificarAcesso(userId) {
     const res = await pool.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [userId]);
     const user = res.rows[0];
-    const plano = user?.plano || 'FREE';
+    let plano = user?.plano || 'FREE';
     const expiracao = user?.vip_expiracao;
 
+    // Se o VIP venceu, rebaixa para FREE imediatamente
     if (plano === 'VIP') {
         if (expiracao && new Date() > new Date(expiracao)) {
             await pool.query("UPDATE usuarios SET plano = 'FREE', vip_expiracao = NULL WHERE telegram_id = $1", [userId]);
-            return { pode: false, msg: "⚠️ <b>Seu plano VIP expirou!</b>\n\nSua assinatura chegou ao fim. Renove enviando o PIX para continuar sem limites." };
+            plano = 'FREE'; 
+        } else {
+            return { pode: true, plano: 'VIP' };
         }
-        return { pode: true, plano: 'VIP' };
     }
 
+    // Regra do FREE: Máximo 15 registros. Se o VIP venceu e ele tem > 15, tranca o bot.
     const contagem = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
     const totalRegistros = parseInt(contagem.rows[0].total);
+    
     if (totalRegistros >= 15) {
-        return { pode: false, msg: `🔒 <b>Limite Atingido!</b>\n\nVocê atingiu o teto de 15 registros do plano Free. Torne-se <b>VIP</b> para liberar o acesso!` };
+        return { 
+            pode: false, 
+            msg: `🔒 <b>Acesso Bloqueado!</b>\n\nSeu plano VIP expirou ou você atingiu o limite de registros gratuitos.\n\nPara voltar a utilizar o bot e registrar novos valores, renove seu <b>Plano VIP</b> no menu abaixo.` 
+        };
     }
     return { pode: true, plano: 'FREE' };
 }
@@ -97,13 +104,22 @@ bot.on('message', async (msg) => {
 
     await pool.query('INSERT INTO usuarios (telegram_id, username) VALUES ($1, $2) ON CONFLICT (telegram_id) DO UPDATE SET username = $2', [userId, msg.from.username || 'Usuario']);
 
+    // --- COMANDO /CLEAN (ZERAR HISTÓRICO) ---
+    if (text === '/clean') {
+        try {
+            await pool.query("DELETE FROM transacoes WHERE user_id = $1", [userId]);
+            return bot.sendMessage(chatId, "🗑️ <b>Histórico limpo!</b> Todos os seus registros foram apagados com sucesso.", { parse_mode: 'HTML' });
+        } catch (e) {
+            return bot.sendMessage(chatId, "❌ Erro ao limpar histórico.");
+        }
+    }
+
     // --- COMANDOS EXCLUSIVOS DO DONO ---
-    if (text.startsWith('/vip') || text === '/vips' || text === '/planilha_vips') {
+    if (text.startsWith('/vip') || text === '/vips' || text === '/planilha_vip') {
         if (userId !== ID_DONO) {
             return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
         }
 
-        // COMANDO: /vip ID
         if (text.startsWith('/vip ')) {
             const idParaPromover = text.replace('/vip', '').trim();
             if (!idParaPromover || isNaN(idParaPromover)) return bot.sendMessage(chatId, "⚠️ Use: /vip ID");
@@ -113,21 +129,19 @@ bot.on('message', async (msg) => {
             } catch (e) { return bot.sendMessage(chatId, "❌ Erro no banco."); }
         }
 
-        // COMANDO: /vips (CORREÇÃO DA DATA 1970)
         if (text === '/vips') {
             const res = await pool.query("SELECT telegram_id, username, vip_expiracao FROM usuarios WHERE plano = 'VIP' ORDER BY vip_expiracao ASC");
             if (res.rowCount === 0) return bot.sendMessage(chatId, "Nenhum VIP ativo no momento.");
             
             let lista = "📋 <b>CLIENTES VIP ATIVOS:</b>\n\n";
             res.rows.forEach(u => {
-                const dataExp = u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleDateString('pt-BR') : "Data não definida";
-                lista += `👤 @${u.username || 'Sem Username'} (<code>${u.telegram_id}</code>)\n📅 Vence em: <b>${dataExp}</b>\n\n`;
+                const dataExp = u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleDateString('pt-BR') : "Sem data";
+                lista += `👤 @${u.username || 'Sem User'} (<code>${u.telegram_id}</code>)\n📅 Vence em: <b>${dataExp}</b>\n\n`;
             });
             return bot.sendMessage(chatId, lista, { parse_mode: 'HTML' });
         }
 
-        // COMANDO: /planilha_vips (CORREÇÃO COLUNA EXPIRAÇÃO)
-        if (text === '/planilha_vips') {
+        if (text === '/planilha_vip') {
             const res = await pool.query("SELECT telegram_id, username, plano, vip_expiracao, data_cadastro FROM usuarios WHERE plano = 'VIP'");
             
             const workbook = new ExcelJS.Workbook();
@@ -145,27 +159,40 @@ bot.on('message', async (msg) => {
                     id: String(u.telegram_id),
                     user: u.username || 'N/A',
                     plano: u.plano,
-                    expira: u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleString('pt-BR') : 'Expirado/Sem Data',
+                    expira: u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleString('pt-BR') : 'N/A',
                     cadastro: u.data_cadastro ? new Date(u.data_cadastro).toLocaleString('pt-BR') : '-'
                 });
             });
 
             const filePath = './VIPS_Financeiro.xlsx';
             await workbook.xlsx.writeFile(filePath);
-            await bot.sendDocument(chatId, filePath, { caption: "📊 Planilha de controle VIP atualizada." });
-            return fs.unlinkSync(filePath);
+            await bot.sendDocument(chatId, filePath, { caption: "📊 Planilha de controle VIP atualizada. Veja a validade de todos os clientes." });
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            return;
         }
     }
 
     if (text === '/start' || text === '⬅️ Voltar') {
         delete estados[userId];
-        return bot.sendMessage(chatId, "<b>Financeiro Pro 🚀</b>\nEscolha uma opção:", { parse_mode: 'HTML', ...menuPrincipal });
+        return bot.sendMessage(chatId, "<b>Financeiro Pro 🚀</b>\nEscolha uma opção no menu abaixo:", { parse_mode: 'HTML', ...menuPrincipal });
     }
 
+    // --- MENSAGEM VIP COM QR CODE (R$ 5,00) ---
     if (text === '💎 Plano VIP') {
-        return bot.sendMessage(chatId, `👑 <b>MODO VIP ILIMITADO</b>\n\nAssine por <b>R$ 2,50/mês</b>!\n🔑 PIX: <code>d6e581ca-196b-4c5b-a4d4-33947695144e</code>\nEnvie comprovante para @fusca_azul1`, { parse_mode: 'HTML' });
+        const chavePix = 'd6e581ca-196b-4c5b-a4d4-33947695144e';
+        // Gerador de QR Code através de API gratuita:
+        const qrUrl = `https://quickchart.io/qr?text=${chavePix}&size=300&margin=2`;
+        
+        const msgVip = `👑 <b>MODO VIP ILIMITADO</b>\n\n` +
+            `Assine por apenas <b>R$ 5,00/mês</b> para ter registros ilimitados e não perder seu histórico!\n\n` +
+            `📷 Escaneie o <b>QR Code</b> acima no app do seu banco ou utilize o Pix Copia e Cola abaixo:\n\n` +
+            `🔑 <b>PIX Copia e Cola:</b> <code>${chavePix}</code>\n\n` +
+            `✅ Após o pagamento, envie o comprovante para @fusca_azul1 para liberação imediata.`;
+
+        return bot.sendPhoto(chatId, qrUrl, { caption: msgVip, parse_mode: 'HTML' });
     }
 
+    // --- PERFIL COM DATA EXATA DE EXPIRAÇÃO ---
     if (text === '👤 Perfil') {
         const res = await pool.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [userId]);
         const count = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
@@ -174,53 +201,129 @@ bot.on('message', async (msg) => {
         let exp = "";
         if (user?.plano === 'VIP' && user.vip_expiracao) {
             const d = new Date(user.vip_expiracao);
-            exp = `\n📅 Expira: <b>${d.toLocaleDateString('pt-BR')} às ${d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute:'2-digit'})}</b>`;
+            exp = `\n📅 Expira em: <b>${d.toLocaleDateString('pt-BR')} às ${d.toLocaleTimeString('pt-BR', {hour: '2-digit', minute:'2-digit'})}</b>`;
         }
 
-        return bot.sendMessage(chatId, `👤 <b>Perfil</b>\nID: <code>${userId}</code>\nPlano: <b>${user?.plano || 'FREE'}</b>${exp}\nRegistros: ${count.rows[0].total}`, { parse_mode: 'HTML' });
+        return bot.sendMessage(chatId, `👤 <b>Perfil</b>\n\nID: <code>${userId}</code>\nPlano: <b>${user?.plano || 'FREE'}</b>${exp}\nTotal de Registros: <b>${count.rows[0].total}</b>`, { parse_mode: 'HTML' });
     }
 
     const estado = estados[userId];
     if (!estado) {
-        if (text === '💸 Gastei' || text === '💰 Ganhei') {
+        if (text === '💸 Gastei' || text === '💰 Ganhei' || text === '📈 Investi') {
             const check = await verificarAcesso(userId);
             if (!check.pode) return bot.sendMessage(chatId, check.msg, { parse_mode: 'HTML' });
-            estados[userId] = { acao: 'pedir_valor', tipo: text === '💸 Gastei' ? 'saida' : 'entrada' };
-            return bot.sendMessage(chatId, "Qual o valor? (Ex: 50.00)", tecladoVoltar);
+            
+            let tipo = 'saida';
+            let conversa = "Qual o valor que você gastou? (Ex: 50.00)";
+            
+            if (text === '💰 Ganhei') {
+                tipo = 'entrada';
+                conversa = "Que ótimo! Qual foi o valor que você recebeu? (Ex: 150.50)";
+            } else if (text === '📈 Investi') {
+                tipo = 'investimento';
+                conversa = "📈 Hora de multiplicar! Quanto você investiu hoje? (Ex: 100.00)";
+            }
+
+            estados[userId] = { acao: 'pedir_valor', tipo: tipo };
+            return bot.sendMessage(chatId, conversa, tecladoVoltar);
         }
+        
         if (text === '📊 Gráfico') return enviarGraficoCompleto(chatId, userId);
         if (text === '📄 Relatório') return enviarRelatorio(chatId, userId);
+        
         return bot.sendMessage(chatId, "🤖 Use o menu abaixo:", menuPrincipal);
     }
 
     if (estado.acao === 'pedir_valor') {
         const v = parseValor(text);
-        if (isNaN(v)) return bot.sendMessage(chatId, "⚠️ Valor inválido.", tecladoVoltar);
-        estado.valor = v; estado.acao = 'pedir_desc';
-        return bot.sendMessage(chatId, "Digite a descrição:", tecladoVoltar);
+        if (isNaN(v)) return bot.sendMessage(chatId, "⚠️ Valor inválido. Digite apenas números.", tecladoVoltar);
+        
+        estado.valor = v; 
+        estado.acao = 'pedir_desc';
+        
+        let msgDesc = "";
+        if (estado.tipo === 'entrada') msgDesc = "De onde veio esse dinheiro? (Ex: Salário, Venda de bolo, Pix do João)";
+        else if (estado.tipo === 'saida') msgDesc = "Com o que você gastou? (Ex: Mercado, Conta de Luz, Lanche)";
+        else if (estado.tipo === 'investimento') msgDesc = "Onde você aplicou esse valor? (Ex: Tesouro Direto, CDB Banco, Bitcoin)";
+        
+        return bot.sendMessage(chatId, msgDesc, tecladoVoltar);
     }
 
     if (estado.acao === 'pedir_desc') {
         await pool.query('INSERT INTO transacoes (user_id, tipo, valor, descricao) VALUES ($1, $2, $3, $4)', [userId, estado.tipo, estado.valor, text]);
-        bot.sendMessage(chatId, `✅ Salvo: R$${estado.valor.toFixed(2)}`, menuPrincipal);
+        
+        let emojiFinal = '🔴';
+        if (estado.tipo === 'entrada') emojiFinal = '🟢';
+        if (estado.tipo === 'investimento') emojiFinal = '📈';
+
+        bot.sendMessage(chatId, `${emojiFinal} Tudo certo! Registro de <b>R$ ${estado.valor.toFixed(2)}</b> salvo com sucesso.`, { parse_mode: 'HTML', ...menuPrincipal });
         delete estados[userId];
     }
 });
 
+// --- GRÁFICO MELHORADO + TEXTO DETALHADO ---
 async function enviarGraficoCompleto(chatId, userId) {
     const res = await pool.query("SELECT tipo, SUM(valor) as total FROM transacoes WHERE user_id = $1 GROUP BY tipo", [userId]);
-    if (res.rowCount === 0) return bot.sendMessage(chatId, "Sem dados.");
-    let gn = 0, gs = 0; res.rows.forEach(r => { if (r.tipo === 'entrada') gn = parseFloat(r.total); else gs = parseFloat(r.total); });
+    if (res.rowCount === 0) return bot.sendMessage(chatId, "Sem dados suficientes para gerar um gráfico.");
+    
+    let gn = 0, gs = 0, inv = 0; 
+    res.rows.forEach(r => { 
+        if (r.tipo === 'entrada') gn = parseFloat(r.total); 
+        else if (r.tipo === 'saida') gs = parseFloat(r.total); 
+        else if (r.tipo === 'investimento') inv = parseFloat(r.total);
+    });
+
+    const saldoDisponivel = gn - gs - inv;
+    const patrimonioTotal = gn - gs; // Saldo + Investimentos
+
     const chart = new QuickChart();
-    chart.setConfig({ type: 'pie', data: { labels: ['Ganhos', 'Gastos'], datasets: [{ data: [gn, gs], backgroundColor: ['#2ecc71', '#e74c3c'] }] } });
-    bot.sendPhoto(chatId, await chart.getShortUrl(), { caption: `💰 Saldo: R$ ${(gn - gs).toFixed(2)}`, parse_mode: 'HTML' });
+    chart.setConfig({ 
+        type: 'doughnut', 
+        data: { 
+            labels: ['Ganhos', 'Gastos', 'Investimentos'], 
+            datasets: [{ 
+                data: [gn, gs, inv], 
+                backgroundColor: ['#2ecc71', '#e74c3c', '#3498db'],
+                borderWidth: 2
+            }] 
+        },
+        options: {
+            plugins: { legend: { position: 'bottom', labels: { fontSize: 16 } } }
+        }
+    }).setWidth(500).setHeight(350);
+
+    const msgInfo = `📊 <b>RESUMO FINANCEIRO DETALHADO</b>\n\n` +
+        `🟢 <b>Ganhos Totais:</b> R$ ${gn.toFixed(2)}\n` +
+        `🔴 <b>Gastos Totais:</b> R$ ${gs.toFixed(2)}\n` +
+        `📈 <b>Investimentos:</b> R$ ${inv.toFixed(2)}\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `💰 <b>Dinheiro Disponível (Conta):</b> R$ ${saldoDisponivel.toFixed(2)}\n` +
+        `🏦 <b>Patrimônio Total:</b> R$ ${patrimonioTotal.toFixed(2)}\n\n` +
+        `<i>*Seu Patrimônio Total é a soma do dinheiro na conta mais os seus investimentos.</i>`;
+
+    bot.sendPhoto(chatId, await chart.getShortUrl(), { caption: msgInfo, parse_mode: 'HTML' });
 }
 
+// --- RELATÓRIO MELHORADO E FORMATADO ---
 async function enviarRelatorio(chatId, userId) {
-    const res = await pool.query("SELECT * FROM transacoes WHERE user_id = $1 ORDER BY data DESC LIMIT 10", [userId]);
-    let m = "📋 <b>Últimos Lançamentos:</b>\n\n";
-    res.rows.forEach(t => m += `${t.tipo === 'entrada' ? '🟢' : '🔴'} R$${parseFloat(t.valor).toFixed(2)} - ${t.descricao}\n`);
+    const res = await pool.query("SELECT * FROM transacoes WHERE user_id = $1 ORDER BY data DESC LIMIT 15", [userId]);
+    if (res.rowCount === 0) return bot.sendMessage(chatId, "Seu histórico está vazio no momento.");
+
+    let m = "📋 <b>SEUS ÚLTIMOS LANÇAMENTOS:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n";
+    
+    res.rows.forEach(t => {
+        let icone = '🔴';
+        if (t.tipo === 'entrada') icone = '🟢';
+        if (t.tipo === 'investimento') icone = '📈';
+
+        const d = new Date(t.data);
+        const dataFormatada = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}`;
+
+        m += `${icone} <b>R$ ${parseFloat(t.valor).toFixed(2)}</b> - ${t.descricao} <i>(${dataFormatada})</i>\n`;
+    });
+    
+    m += "━━━━━━━━━━━━━━━━━━━━━━\n<i>Para visualizar todo o seu histórico e limpar os dados, gere uma planilha ou fale com o Suporte.</i>";
     bot.sendMessage(chatId, m, { parse_mode: 'HTML' });
 }
 
-const app = express(); app.get('/', (r, s) => s.send('Online')); app.listen(process.env.PORT || 3000);
+const app = express(); app.get('/', (r, s) => s.send('Bot Online - Gestão Premium Ativa')); app.listen(process.env.PORT || 3000);
