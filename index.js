@@ -49,7 +49,12 @@ const estados = {};
 // --- INTERFACE (MENU ATUALIZADO) ---
 const menuPrincipal = {
     reply_markup: {
-        keyboard: [['💰 Ganhei', '💸 Gastei', '📈 Investi'], ['📊 Gráfico', '📄 Relatório'], ['💎 Plano VIP', '👤 Perfil']],
+        keyboard: [
+            ['💰 Ganhei', '💸 Gastei', '📈 Investi'], 
+            ['📊 Gráfico', '📄 Relatório'], 
+            ['💎 Plano VIP', '👤 Perfil'],
+            ['🛠️ Suporte']
+        ],
         resize_keyboard: true
     }
 };
@@ -128,6 +133,12 @@ bot.on('message', async (msg) => {
     }
 
     // --- COMANDOS EXCLUSIVOS DO DONO ---
+    if (text === '/addvip') {
+        if (userId !== ID_DONO) return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
+        estados[userId] = { acao: 'pedir_id_vip' };
+        return bot.sendMessage(chatId, "👤 <b>Adicionar VIP</b>\n\nEnvie o <b>ID do usuário</b> que você deseja promover para VIP (30 dias):", { parse_mode: 'HTML', ...tecladoVoltar });
+    }
+
     if (text.startsWith('/vip') || text === '/vips' || text === '/planilha_vip') {
         if (userId !== ID_DONO) {
             return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
@@ -190,10 +201,10 @@ bot.on('message', async (msg) => {
         return bot.sendMessage(chatId, "<b>Financeiro Pro 🚀</b>\nEscolha uma opção no menu abaixo:", { parse_mode: 'HTML', ...menuPrincipal });
     }
 
-    // --- MENSAGEM VIP (LINK NO LUGAR DO QR CODE) ---
+    // --- MENSAGEM VIP ---
     if (text === '💎 Plano VIP') {
         const chavePix = 'd6e581ca-196b-4c5b-a4d4-33947695144e';
-        const linkQrCode = 'https://nubank.com.br/cobrar/ckgfui/69f15cc6-a283-4731-a46c-78da2c9b0bd3'; // <--- INSIRA O LINK DA SUA IMAGEM/CÓDIGO AQUI
+        const linkQrCode = 'https://nubank.com.br/cobrar/ckgfui/69f15cc6-a283-4731-a46c-78da2c9b0bd3'; 
         
         const msgVip = `👑 <b>MODO VIP ILIMITADO</b>\n\n` +
             `Assine por apenas <b>R$ 5,00/mês</b> para ter registros ilimitados e não perder seu histórico!\n\n` +
@@ -204,7 +215,17 @@ bot.on('message', async (msg) => {
         return bot.sendMessage(chatId, msgVip, { parse_mode: 'HTML' });
     }
 
-    // --- PERFIL (COM MENSAGEM DE EXPIRAÇÃO NO FINAL) ---
+    // --- BOTÃO DE SUPORTE DIRETO ---
+    if (text === '🛠️ Suporte') {
+        return bot.sendMessage(chatId, "👨‍💻 <b>Atendimento e Suporte</b>\n\nPrecisa de ajuda com o bot, encontrou um problema ou quer enviar o seu comprovante VIP?\n\nClique no botão abaixo para falar diretamente comigo:", {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [[{ text: '💬 Falar com @fusca_azul1', url: 'https://t.me/fusca_azul1' }]]
+            }
+        });
+    }
+
+    // --- PERFIL ---
     if (text === '👤 Perfil') {
         const res = await pool.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [userId]);
         const count = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
@@ -248,6 +269,21 @@ bot.on('message', async (msg) => {
         if (text === '📄 Relatório') return enviarRelatorio(chatId, userId);
         
         return bot.sendMessage(chatId, "🤖 Use o menu abaixo:", menuPrincipal);
+    }
+
+    // LÓGICA DO COMANDO /ADDVIP CONVERSACIONAL (Para o Dono)
+    if (estado.acao === 'pedir_id_vip') {
+        const idPromover = text.trim();
+        if (isNaN(idPromover)) return bot.sendMessage(chatId, "⚠️ O ID deve conter apenas números. Tente novamente ou use '⬅️ Voltar':", tecladoVoltar);
+        
+        try {
+            await pool.query("UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1", [idPromover]);
+            bot.sendMessage(chatId, `⭐ Sucesso! O usuário de ID <code>${idPromover}</code> agora é VIP por 30 dias!`, { parse_mode: 'HTML', ...menuPrincipal });
+        } catch (e) {
+            bot.sendMessage(chatId, "❌ Erro ao promover usuário. Verifique se o ID existe no banco.", menuPrincipal);
+        }
+        delete estados[userId];
+        return;
     }
 
     if (estado.acao === 'pedir_valor') {
