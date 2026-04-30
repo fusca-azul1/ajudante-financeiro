@@ -51,9 +51,9 @@ const menuPrincipal = {
     reply_markup: {
         keyboard: [
             ['💰 Ganhei', '💸 Gastei', '📈 Investi'], 
-            ['📊 Gráfico', '📄 Relatório'], 
-            ['💎 Plano VIP', '👤 Perfil'],
-            ['🛠️ Suporte']
+            ['📊 Análise', '📄 Histórico'], 
+            ['👑 Desbloquear Imperium', '👤 Minha Conta'],
+            ['🛠 Ajuda']
         ],
         resize_keyboard: true
     }
@@ -87,7 +87,20 @@ async function verificarAcesso(userId) {
     if (totalRegistros >= 15) {
         return { 
             pode: false, 
-            msg: `🔒 <b>Acesso Bloqueado!</b>\n\nSeu plano VIP expirou ou você atingiu o limite de registros gratuitos.\n\nPara voltar a utilizar o bot e registrar novos valores, renove seu <b>Plano VIP</b> no menu abaixo.` 
+            msg: `🔒 <b>Acesso pausado</b>\n\n` +
+                 `Você já começou a organizar seu dinheiro.\n\n` +
+                 `Agora parar aqui significa voltar ao descontrole.\n\n` +
+                 `━━━━━━━━━━━━━━━━━━\n\n` +
+                 `Você atingiu o limite do plano gratuito.\n\n` +
+                 `Sem controle, você volta a perder dinheiro sem perceber — e isso custa muito mais do que imagina.\n\n` +
+                 `━━━━━━━━━━━━━━━━━━\n\n` +
+                 `👑 <b>Desbloqueie o Modo Imperium:</b>\n\n` +
+                 `• Registros ilimitados\n` +
+                 `• Histórico completo sempre disponível\n` +
+                 `• Controle total do seu dinheiro\n\n` +
+                 `━━━━━━━━━━━━━━━━━━\n\n` +
+                 `💡 <b>Invista R$ 5 e tenha controle todos os dias.</b>\n\n` +
+                 `Clique em <b>Desbloquear Imperium</b> abaixo e continue evoluindo.`
         };
     }
     return { pode: true, plano: 'FREE' };
@@ -109,7 +122,7 @@ bot.on('message', async (msg) => {
 
     await pool.query('INSERT INTO usuarios (telegram_id, username) VALUES ($1, $2) ON CONFLICT (telegram_id) DO UPDATE SET username = $2', [userId, msg.from.username || 'Usuario']);
 
-    // --- COMANDO /CLEAN (ZERAR HISTÓRICO DO USUÁRIO) ---
+    // --- COMANDO /CLEAN ---
     if (text === '/clean') {
         try {
             await pool.query("DELETE FROM transacoes WHERE user_id = $1", [userId]);
@@ -119,14 +132,14 @@ bot.on('message', async (msg) => {
         }
     }
 
-    // --- COMANDO /CLS (ZERAR TODO O BANCO DE DADOS - SÓ O DONO) ---
+    // --- COMANDO /CLS ---
     if (text === '/cls') {
         if (userId !== ID_DONO) {
             return bot.sendMessage(chatId, "❌ Apenas o dono pode utilizar este comando.");
         }
         try {
             await pool.query("TRUNCATE TABLE transacoes, usuarios RESTART IDENTITY CASCADE;");
-            return bot.sendMessage(chatId, "⚠️ <b>BANCO DE DADOS TOTALMENTE ZERADO!</b>\nTodos os usuários, VIPs e registros financeiros foram apagados permanentemente.", { parse_mode: 'HTML' });
+            return bot.sendMessage(chatId, "⚠️ <b>BANCO DE DADOS TOTALMENTE ZERADO!</b>\nTodos os usuários, contas e registros financeiros foram apagados permanentemente.", { parse_mode: 'HTML' });
         } catch (e) {
             return bot.sendMessage(chatId, "❌ Erro ao limpar o banco de dados geral.");
         }
@@ -136,7 +149,7 @@ bot.on('message', async (msg) => {
     if (text === '/addvip') {
         if (userId !== ID_DONO) return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
         estados[userId] = { acao: 'pedir_id_vip' };
-        return bot.sendMessage(chatId, "👤 <b>Adicionar VIP</b>\n\nEnvie o <b>ID do usuário</b> que você deseja promover para VIP (30 dias):", { parse_mode: 'HTML', ...tecladoVoltar });
+        return bot.sendMessage(chatId, "👤 <b>Adicionar Imperium Plus</b>\n\nEnvie o <b>ID do usuário</b> que você deseja promover (30 dias):", { parse_mode: 'HTML', ...tecladoVoltar });
     }
 
     if (text.startsWith('/vip') || text === '/vips' || text === '/planilha_vip') {
@@ -149,15 +162,15 @@ bot.on('message', async (msg) => {
             if (!idParaPromover || isNaN(idParaPromover)) return bot.sendMessage(chatId, "⚠️ Use: /vip ID");
             try {
                 await pool.query("UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1", [idParaPromover]);
-                return bot.sendMessage(chatId, `⭐ ID <code>${idParaPromover}</code> promovido por 30 dias!`, { parse_mode: 'HTML' });
+                return bot.sendMessage(chatId, `⭐ ID <code>${idParaPromover}</code> promovido para Imperium Plus por 30 dias!`, { parse_mode: 'HTML' });
             } catch (e) { return bot.sendMessage(chatId, "❌ Erro no banco."); }
         }
 
         if (text === '/vips') {
             const res = await pool.query("SELECT telegram_id, username, vip_expiracao FROM usuarios WHERE plano = 'VIP' ORDER BY vip_expiracao ASC");
-            if (res.rowCount === 0) return bot.sendMessage(chatId, "Nenhum VIP ativo no momento.");
+            if (res.rowCount === 0) return bot.sendMessage(chatId, "Nenhum usuário Imperium Plus ativo no momento.");
             
-            let lista = "📋 <b>CLIENTES VIP ATIVOS:</b>\n\n";
+            let lista = "📋 <b>CLIENTES IMPERIUM PLUS ATIVOS:</b>\n\n";
             res.rows.forEach(u => {
                 const dataExp = u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleDateString('pt-BR') : "Sem data";
                 lista += `👤 @${u.username || 'Sem User'} (<code>${u.telegram_id}</code>)\n📅 Vence em: <b>${dataExp}</b>\n\n`;
@@ -169,7 +182,7 @@ bot.on('message', async (msg) => {
             const res = await pool.query("SELECT telegram_id, username, plano, vip_expiracao, data_cadastro FROM usuarios WHERE plano = 'VIP'");
             
             const workbook = new ExcelJS.Workbook();
-            const worksheet = workbook.addWorksheet('Clientes VIP');
+            const worksheet = workbook.addWorksheet('Clientes Imperium Plus');
             worksheet.columns = [
                 { header: 'Telegram ID', key: 'id', width: 20 },
                 { header: 'Username', key: 'user', width: 20 },
@@ -188,9 +201,9 @@ bot.on('message', async (msg) => {
                 });
             });
 
-            const filePath = './VIPS_Financeiro.xlsx';
+            const filePath = './Imperium_Financeiro.xlsx';
             await workbook.xlsx.writeFile(filePath);
-            await bot.sendDocument(chatId, filePath, { caption: "📊 Planilha de controle VIP atualizada. Veja a validade de todos os clientes." });
+            await bot.sendDocument(chatId, filePath, { caption: "📊 Planilha de controle Imperium Plus atualizada. Veja a validade de todos os clientes." });
             if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
             return;
         }
@@ -198,26 +211,38 @@ bot.on('message', async (msg) => {
 
     if (text === '/start' || text === '⬅️ Voltar') {
         delete estados[userId];
-        return bot.sendMessage(chatId, "<b>Financeiro Pro 🚀</b>\nEscolha uma opção no menu abaixo:", { parse_mode: 'HTML', ...menuPrincipal });
+        
+        const msgStart = `👑 <b>Imperium Cash</b>\n\nPare de perder o controle do seu dinheiro sem perceber.\n\nCom o Imperium Cash você:\n• Registra ganhos, gastos e investimentos em segundos  \n• Visualiza tudo com gráficos automáticos  \n• Entende exatamente para onde seu dinheiro está indo  \n\n━━━━━━━━━━━━━━━━━━\n\n💡 <b>Comece agora:</b>  \nEscolha uma opção no menu abaixo e registre seu primeiro valor.\n\nQuanto antes você começa, mais controle você tem.`;
+
+        if (text === '/start') {
+            try {
+                return await bot.sendPhoto(chatId, './imperium_cash.jpg', { caption: msgStart, parse_mode: 'HTML', ...menuPrincipal });
+            } catch (error) {
+                return bot.sendMessage(chatId, msgStart, { parse_mode: 'HTML', ...menuPrincipal });
+            }
+        } else {
+            return bot.sendMessage(chatId, msgStart, { parse_mode: 'HTML', ...menuPrincipal });
+        }
     }
 
-    // --- MENSAGEM VIP ---
-    if (text === '💎 Plano VIP') {
+    // --- MENSAGEM MODO IMPERIUM ---
+    if (text === '👑 Desbloquear Imperium') {
         const chavePix = 'd6e581ca-196b-4c5b-a4d4-33947695144e';
         const linkQrCode = 'https://nubank.com.br/cobrar/ckgfui/69f15cc6-a283-4731-a46c-78da2c9b0bd3'; 
         
-        const msgVip = `👑 <b>MODO VIP ILIMITADO</b>\n\n` +
-            `Assine por apenas <b>R$ 5,00/mês</b> para ter registros ilimitados e não perder seu histórico!\n\n` +
+        const msgVip = `🔒 <b>Desbloqueie o Modo Imperium e tenha acesso ilimitado</b>\n\n` +
+            `💡 Menos que um lanche por mês para nunca mais perder o controle do seu dinheiro.\n\n` +
+            `Assine o <b>Imperium Plus</b> por apenas <b>R$ 5,00/mês</b> para ter registros ilimitados e não perder seu histórico!\n\n` +
             `📷 Acesse o QR Code aqui: ${linkQrCode}\n\n` +
             `🔑 <b>PIX Copia e Cola:</b> <code>${chavePix}</code>\n\n` +
-            `✅ Após o pagamento, envie o comprovante junto com seu id localizado em seu perfil para @fusca_azul1 para liberação imediata.`;
+            `✅ Envie o comprovante + ID e liberação é feita em minutos @fusca_azul1 .\n🔥 Mais de 100 usuários já estão organizando suas finanças com o Imperium Cash.`;
 
         return bot.sendMessage(chatId, msgVip, { parse_mode: 'HTML' });
     }
 
-    // --- BOTÃO DE SUPORTE DIRETO ---
-    if (text === '🛠️ Suporte') {
-        return bot.sendMessage(chatId, "👨‍💻 <b>Atendimento e Suporte</b>\n\nPrecisa de ajuda com o bot, encontrou um problema ou quer enviar o seu comprovante VIP?\n\nClique no botão abaixo para falar diretamente comigo:", {
+    // --- BOTÃO DE AJUDA DIRETO ---
+    if (text === '🛠 Ajuda') {
+        return bot.sendMessage(chatId, "👨‍💻 <b>Atendimento e Suporte</b>\n\nPrecisa de ajuda com o bot, encontrou um problema ou quer enviar o seu comprovante?\n\nClique no botão abaixo para falar diretamente comigo:", {
             parse_mode: 'HTML',
             reply_markup: {
                 inline_keyboard: [[{ text: '💬 Falar com @fusca_azul1', url: 'https://t.me/fusca_azul1' }]]
@@ -225,23 +250,28 @@ bot.on('message', async (msg) => {
         });
     }
 
-    // --- PERFIL ---
-    if (text === '👤 Perfil') {
+    // --- MINHA CONTA ---
+    if (text === '👤 Minha Conta') {
         const res = await pool.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [userId]);
         const count = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
         const user = res.rows[0];
         
         let exp = "";
-        if (user?.plano === 'VIP' && user.vip_expiracao) {
-            const d = new Date(user.vip_expiracao);
-            const dia = String(d.getDate()).padStart(2, '0');
-            const mes = String(d.getMonth() + 1).padStart(2, '0');
-            const ano = d.getFullYear();
-            
-            exp = `\n\nSeu vip expira dia (${dia}/${mes}/${ano})`;
+        let nomePlano = 'Básico (Free)';
+
+        if (user?.plano === 'VIP') {
+            nomePlano = '👑 Imperium Plus';
+            if (user.vip_expiracao) {
+                const d = new Date(user.vip_expiracao);
+                const dia = String(d.getDate()).padStart(2, '0');
+                const mes = String(d.getMonth() + 1).padStart(2, '0');
+                const ano = d.getFullYear();
+                
+                exp = `\n\nSeu Imperium Plus expira dia (${dia}/${mes}/${ano})`;
+            }
         }
 
-        return bot.sendMessage(chatId, `👤 <b>Perfil</b>\n\nID: <code>${userId}</code>\nPlano: <b>${user?.plano || 'FREE'}</b>\nTotal de Registros: <b>${count.rows[0].total}</b>${exp}`, { parse_mode: 'HTML' });
+        return bot.sendMessage(chatId, `👤 <b>Minha Conta</b>\n\nID: <code>${userId}</code>\nPlano: <b>${nomePlano}</b>\nTotal de Registros: <b>${count.rows[0].total}</b>${exp}`, { parse_mode: 'HTML' });
     }
 
     const estado = estados[userId];
@@ -265,20 +295,19 @@ bot.on('message', async (msg) => {
             return bot.sendMessage(chatId, conversa, tecladoVoltar);
         }
         
-        if (text === '📊 Gráfico') return enviarGraficoCompleto(chatId, userId);
-        if (text === '📄 Relatório') return enviarRelatorio(chatId, userId);
+        if (text === '📊 Análise') return enviarGraficoCompleto(chatId, userId);
+        if (text === '📄 Histórico') return enviarRelatorio(chatId, userId);
         
         return bot.sendMessage(chatId, "🤖 Use o menu abaixo:", menuPrincipal);
     }
 
-    // LÓGICA DO COMANDO /ADDVIP CONVERSACIONAL (Para o Dono)
     if (estado.acao === 'pedir_id_vip') {
         const idPromover = text.trim();
         if (isNaN(idPromover)) return bot.sendMessage(chatId, "⚠️ O ID deve conter apenas números. Tente novamente ou use '⬅️ Voltar':", tecladoVoltar);
         
         try {
             await pool.query("UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1", [idPromover]);
-            bot.sendMessage(chatId, `⭐ Sucesso! O usuário de ID <code>${idPromover}</code> agora é VIP por 30 dias!`, { parse_mode: 'HTML', ...menuPrincipal });
+            bot.sendMessage(chatId, `⭐ Sucesso! O usuário de ID <code>${idPromover}</code> agora possui o Imperium Plus por 30 dias!`, { parse_mode: 'HTML', ...menuPrincipal });
         } catch (e) {
             bot.sendMessage(chatId, "❌ Erro ao promover usuário. Verifique se o ID existe no banco.", menuPrincipal);
         }
@@ -304,11 +333,18 @@ bot.on('message', async (msg) => {
     if (estado.acao === 'pedir_desc') {
         await pool.query('INSERT INTO transacoes (user_id, tipo, valor, descricao) VALUES ($1, $2, $3, $4)', [userId, estado.tipo, estado.valor, text]);
         
+        const contagemQuery = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
+        const totalRegistros = parseInt(contagemQuery.rows[0].total);
+
         let emojiFinal = '🔴';
         if (estado.tipo === 'entrada') emojiFinal = '🟢';
         if (estado.tipo === 'investimento') emojiFinal = '📈';
 
-        bot.sendMessage(chatId, `${emojiFinal} Tudo certo! Registro de <b>R$ ${estado.valor.toFixed(2)}</b> salvo com sucesso.`, { parse_mode: 'HTML', ...menuPrincipal });
+        if (totalRegistros === 1) {
+            bot.sendMessage(chatId, `🟢 Boa! Seu primeiro registro foi salvo.\n\n💡 Com o Modo Imperium você teria:\n• Histórico completo\n• Registros ilimitados\n• Controle total sem bloqueios\n\n👑 Quer liberar isso agora?`, { parse_mode: 'HTML', ...menuPrincipal });
+        } else {
+            bot.sendMessage(chatId, `${emojiFinal} Tudo certo! Registro de <b>R$ ${estado.valor.toFixed(2)}</b> salvo com sucesso.\n\n🟢 +1 registro adicionado\nVocê está no controle.\n📊 Progresso financeiro: ${totalRegistros} registros feitos.`, { parse_mode: 'HTML', ...menuPrincipal });
+        }
         delete estados[userId];
     }
 });
@@ -316,7 +352,7 @@ bot.on('message', async (msg) => {
 // --- GRÁFICO MELHORADO + TEXTO DETALHADO ---
 async function enviarGraficoCompleto(chatId, userId) {
     const res = await pool.query("SELECT tipo, SUM(valor) as total FROM transacoes WHERE user_id = $1 GROUP BY tipo", [userId]);
-    if (res.rowCount === 0) return bot.sendMessage(chatId, "Sem dados suficientes para gerar um gráfico.");
+    if (res.rowCount === 0) return bot.sendMessage(chatId, "Sem dados suficientes para gerar uma análise.");
     
     let gn = 0, gs = 0, inv = 0; 
     res.rows.forEach(r => { 
@@ -374,7 +410,7 @@ async function enviarRelatorio(chatId, userId) {
         m += `${icone} <b>R$ ${parseFloat(t.valor).toFixed(2)}</b> - ${t.descricao} <i>(${dataFormatada})</i>\n`;
     });
     
-    m += "━━━━━━━━━━━━━━━━━━━━━━\n<i>Para visualizar todo o seu histórico e limpar os dados, gere uma planilha ou fale com o Suporte.</i>";
+    m += "━━━━━━━━━━━━━━━━━━━━━━\n<i>Para visualizar todo o seu histórico e limpar os dados, gere uma planilha ou fale com a Ajuda.</i>";
     bot.sendMessage(chatId, m, { parse_mode: 'HTML' });
 }
 
