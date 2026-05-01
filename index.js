@@ -24,9 +24,12 @@ async function setupDB() {
                 plano TEXT DEFAULT 'FREE',
                 username TEXT,
                 vip_expiracao TIMESTAMP,
-                data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                origem TEXT DEFAULT 'organico'
             );
             ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS vip_expiracao TIMESTAMP;
+            ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS origem TEXT DEFAULT 'organico';
+            
             CREATE TABLE IF NOT EXISTS transacoes (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT REFERENCES usuarios(telegram_id),
@@ -36,7 +39,7 @@ async function setupDB() {
                 data TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("✅ Banco conectado: Gestão de Investimentos e VIP 2.0 ativados.");
+        console.log("✅ Banco conectado: Gestão de Investimentos, VIP 2.0 e Rastreamento ativados.");
     } catch (err) {
         console.error("❌ Erro ao conectar ao banco:", err);
     }
@@ -120,7 +123,17 @@ bot.on('message', async (msg) => {
 
     if (!text) return;
 
-    await pool.query('INSERT INTO usuarios (telegram_id, username) VALUES ($1, $2) ON CONFLICT (telegram_id) DO UPDATE SET username = $2', [userId, msg.from.username || 'Usuario']);
+    // --- SISTEMA DE RASTREAMENTO DE PARCERIAS ---
+    let origem = 'organico';
+    if (text.startsWith('/start ')) {
+        origem = text.split(' ')[1]; // Pega a palavra após o /start
+    }
+
+    // Insere o usuário. Se ele já existir, ignora a origem (para manter a origem real de onde ele veio a primeira vez) e só atualiza o username
+    await pool.query(
+        'INSERT INTO usuarios (telegram_id, username, origem) VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO UPDATE SET username = $2', 
+        [userId, msg.from.username || 'Usuario', origem]
+    );
 
     // --- COMANDO /CLEAN ---
     if (text === '/clean') {
@@ -152,10 +165,8 @@ bot.on('message', async (msg) => {
         return bot.sendMessage(chatId, "👤 <b>Adicionar Imperium Plus</b>\n\nEnvie o <b>ID do usuário</b> que você deseja promover (30 dias):", { parse_mode: 'HTML', ...tecladoVoltar });
     }
 
-    if (text.startsWith('/vip') || text === '/vips' || text === '/planilha_vip') {
-        if (userId !== ID_DONO) {
-            return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
-        }
+    if (text.startsWith('/vip ') || text === '/vips') {
+        if (userId !== ID_DONO) return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
 
         if (text.startsWith('/vip ')) {
             const idParaPromover = text.replace('/vip', '').trim();
@@ -177,44 +188,56 @@ bot.on('message', async (msg) => {
             });
             return bot.sendMessage(chatId, lista, { parse_mode: 'HTML' });
         }
-
-        if (text === '/planilha_vip') {
-            const res = await pool.query("SELECT telegram_id, username, plano, vip_expiracao, data_cadastro FROM usuarios WHERE plano = 'VIP'");
-            
-            const workbook = new ExcelJS.Workbook();
-            const worksheet = workbook.addWorksheet('Clientes Imperium Plus');
-            worksheet.columns = [
-                { header: 'Telegram ID', key: 'id', width: 20 },
-                { header: 'Username', key: 'user', width: 20 },
-                { header: 'Plano', key: 'plano', width: 10 },
-                { header: 'Data Expiração', key: 'expira', width: 25 },
-                { header: 'Cadastrado em', key: 'cadastro', width: 25 }
-            ];
-
-            res.rows.forEach(u => {
-                worksheet.addRow({
-                    id: String(u.telegram_id),
-                    user: u.username || 'N/A',
-                    plano: u.plano,
-                    expira: u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleString('pt-BR') : 'N/A',
-                    cadastro: u.data_cadastro ? new Date(u.data_cadastro).toLocaleString('pt-BR') : '-'
-                });
-            });
-
-            const filePath = './Imperium_Financeiro.xlsx';
-            await workbook.xlsx.writeFile(filePath);
-            await bot.sendDocument(chatId, filePath, { caption: "📊 Planilha de controle Imperium Plus atualizada. Veja a validade de todos os clientes." });
-            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-            return;
-        }
     }
 
-    if (text === '/start' || text === '⬅️ Voltar') {
+    // --- PLANILHAS (VIP E GERAL COM RASTREAMENTO) ---
+    if (text === '/planilha_vip' || text === '/planilha_geral') {
+        if (userId !== ID_DONO) return bot.sendMessage(chatId, "❌ Apenas o dono pode exportar dados.");
+
+        let queryStr = text === '/planilha_geral' 
+            ? "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios"
+            : "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios WHERE plano = 'VIP'";
+        
+        let nomeArquivo = text === '/planilha_geral' ? 'Relatorio_Todos_Usuarios.xlsx' : 'Relatorio_Imperium_Plus.xlsx';
+
+        const res = await pool.query(queryStr);
+        
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Clientes');
+        worksheet.columns = [
+            { header: 'Telegram ID', key: 'id', width: 20 },
+            { header: 'Username', key: 'user', width: 20 },
+            { header: 'Plano', key: 'plano', width: 10 },
+            { header: 'Origem (Parceiro)', key: 'origem', width: 20 },
+            { header: 'Data Expiração', key: 'expira', width: 25 },
+            { header: 'Cadastrado em', key: 'cadastro', width: 25 }
+        ];
+
+        res.rows.forEach(u => {
+            worksheet.addRow({
+                id: String(u.telegram_id),
+                user: u.username || 'N/A',
+                plano: u.plano,
+                origem: u.origem || 'organico',
+                expira: u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleString('pt-BR') : '-',
+                cadastro: u.data_cadastro ? new Date(u.data_cadastro).toLocaleString('pt-BR') : '-'
+            });
+        });
+
+        const filePath = `./${nomeArquivo}`;
+        await workbook.xlsx.writeFile(filePath);
+        await bot.sendDocument(chatId, filePath, { caption: `📊 Planilha atualizada. Veja a origem de todos os clientes na coluna "Origem".` });
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        return;
+    }
+
+    // --- COMANDO START ATUALIZADO PARA SUPORTAR DEEP LINKS ---
+    if (text.startsWith('/start') || text === '⬅️ Voltar') {
         delete estados[userId];
         
         const msgStart = `👑 <b>Imperium Cash</b>\n\nPare de perder o controle do seu dinheiro sem perceber.\n\nCom o Imperium Cash você:\n• Registra ganhos, gastos e investimentos em segundos  \n• Visualiza tudo com gráficos automáticos  \n• Entende exatamente para onde seu dinheiro está indo  \n\n━━━━━━━━━━━━━━━━━━\n\n💡 <b>Comece agora:</b>  \nEscolha uma opção no menu abaixo e registre seu primeiro valor.\n\nQuanto antes você começa, mais controle você tem.`;
 
-        if (text === '/start') {
+        if (text.startsWith('/start')) {
             try {
                 return await bot.sendPhoto(chatId, './imperium_cash.jpg', { caption: msgStart, parse_mode: 'HTML', ...menuPrincipal });
             } catch (error) {
