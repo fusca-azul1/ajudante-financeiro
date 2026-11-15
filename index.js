@@ -93,6 +93,34 @@ async function setupDB() {
                 reviewed_at TIMESTAMP,
                 reviewed_by BIGINT
             );
+
+            CREATE TABLE IF NOT EXISTS afiliados (
+                id SERIAL PRIMARY KEY,
+                codigo TEXT UNIQUE,
+                nome TEXT,
+                percentual_comissao DECIMAL(5,2) DEFAULT 20.00,
+                ativo BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS comissoes_afiliados (
+                id SERIAL PRIMARY KEY,
+                affiliate_id INT REFERENCES afiliados(id),
+                telegram_id BIGINT,
+                solicitacao_id INT REFERENCES pagamento_solicitacoes(id) UNIQUE,
+                valor_assinatura DECIMAL(12,2),
+                valor_comissao DECIMAL(12,2),
+                status TEXT DEFAULT 'PENDENTE',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                paid_at TIMESTAMP
+            );
+        `);
+
+        // Cadastra ou atualiza o afiliado samuel
+        await pool.query(`
+            INSERT INTO afiliados (codigo, nome, percentual_comissao, ativo)
+            VALUES ('samuel', 'Samuel', 20.00, TRUE)
+            ON CONFLICT (codigo) DO UPDATE SET nome = 'Samuel';
         `);
 
         console.log("✅ Banco conectado com sucesso: Tabelas verificadas e prontas.");
@@ -198,20 +226,34 @@ bot.on('message', async (msg) => {
             );
         }
 
-        // --- SISTEMA DE RASTREAMENTO ---
+        // --- SISTEMA DE RASTREAMENTO DE AFILIADO/ORIGEM ---
         let origem = 'organico';
         if (text.startsWith('/start ')) {
-            origem = text.split(' ')[1];
+            const param = text.split(' ')[1]?.trim();
+            if (param) {
+                const checkAfiliado = await pool.query('SELECT id FROM afiliados WHERE codigo = $1 AND ativo = TRUE', [param]);
+                if (checkAfiliado.rowCount > 0) {
+                    origem = param;
+                }
+            }
         }
 
         const usernameSafe = escapeHtml(msg.from.username || 'Usuario');
-        await pool.query(
-            `INSERT INTO usuarios (telegram_id, username, origem)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (telegram_id)
-             DO UPDATE SET username = $2`,
-            [userId, usernameSafe, origem]
-        );
+        
+        // Verifica se usuário já existe para não sobrescrever origem caso já tenha
+        const userExists = await pool.query('SELECT origem FROM usuarios WHERE telegram_id = $1', [userId]);
+        if (userExists.rowCount === 0) {
+            await pool.query(
+                `INSERT INTO usuarios (telegram_id, username, origem)
+                 VALUES ($1, $2, $3)`,
+                [userId, usernameSafe, origem]
+            );
+        } else {
+            await pool.query(
+                `UPDATE usuarios SET username = $1 WHERE telegram_id = $2`,
+                [usernameSafe, userId]
+            );
+        }
 
         // --- MOSTRAR MEU ID ---
         if (text === '/meuid') {
@@ -220,6 +262,205 @@ bot.on('message', async (msg) => {
                 `🆔 Seu ID do Telegram é:\n<code>${userId}</code>`,
                 { parse_mode: 'HTML' }
             );
+        }
+
+        // --- COMANDO /HELP (ADMIN) ---
+        if (text === '/help') {
+            if (!isOwner(userId)) {
+                return bot.sendMessage(chatId, "❌ Apenas o administrador pode utilizar este comando.");
+            }
+
+            const helpText =
+                `🛠️ <b>PAINEL DE AJUDA ADMINISTRATIVA — IMPERIUM CASH</b>\n\n` +
+                `Lista de comandos e suas funcionalidades:\n\n` +
+                `• /assinantes — Exibe um resumo estatístico com a quantidade de assinantes VIP ativos, usuários FREE e o total geral cadastrados.\n` +
+                `• /pagamentos — Lista todas as solicitações de assinatura Pix pendentes aguardando aprovação.\n` +
+                `• /afiliado — Exibe o relatório completo de indicações, conversões e comissões do afiliado Samuel.\n` +
+                `• /comissoes — Mostra todas as comissões geradas (pendentes e pagas) detalhando os valores e usuários responsáveis.\n` +
+                `• /pagarcomissao [ID] — Altera o status de uma comissão específica de PENDENTE para PAGO após a realização do Pix manual.\n` +
+                `• /addvip — Inicia o fluxo interativo para promover um usuário ao plano Imperium Plus por 30 dias (renovação acumulativa).\n` +
+                `• /vip [ID] — Promove ou renova diretamente o usuário especificado por ID para o plano VIP por mais 30 dias.\n` +
+                `• /vips — Exibe a lista detalhada de todos os clientes Imperium Plus ativos.\n` +
+                `• /planilha_vip — Exporta uma planilha Excel (.xlsx) contendo apenas os assinantes VIP ativos.\n` +
+                `• /planilha_geral — Exporta uma planilha Excel (.xlsx) com o cadastro completo de todos os usuários e suas origens.\n` +
+                `• /cls — Inicia o processo de limpeza total do banco de dados (exige confirmação interativa de segurança).`;
+
+            return bot.sendMessage(chatId, helpText, { parse_mode: 'HTML' });
+        }
+
+        // --- COMANDO /AFILIADO (ADMIN) ---
+        if (text === '/afiliado') {
+            if (!isOwner(userId)) {
+                return bot.sendMessage(chatId, "❌ Apenas o administrador pode utilizar este comando.");
+            }
+
+            try {
+                const afRes = await pool.query("SELECT id FROM afiliados WHERE codigo = 'samuel'");
+                if (afRes.rowCount === 0) {
+                    return bot.sendMessage(chatId, "⚠️ Afiliado Samuel não encontrado no banco de dados.");
+                }
+                const affId = afRes.rows[0].id;
+
+                const totalIndicadosRes = await pool.query("SELECT COUNT(*) as total FROM usuarios WHERE origem = 'samuel'");
+                const indicadosAssinaramRes = await pool.query(
+                    `SELECT COUNT(DISTINCT u.telegram_id) as total 
+                     FROM usuarios u 
+                     JOIN pagamento_solicitacoes p ON u.telegram_id = p.telegram_id 
+                     WHERE u.origem = 'samuel' AND p.status = 'APPROVED'`
+                );
+
+                const totalIndicados = parseInt(totalIndicadosRes.rows[0].total);
+                const indicadosAssinaram = parseInt(indicadosAssinaramRes.rows[0].total);
+                const indicadosNaoAssinaram = totalIndicados - indicadosAssinaram;
+
+                const pagamentosAprovadosRes = await pool.query(
+                    `SELECT COUNT(p.id) as total 
+                     FROM pagamento_solicitacoes p 
+                     JOIN usuarios u ON p.telegram_id = u.telegram_id 
+                     WHERE u.origem = 'samuel' AND p.status = 'APPROVED'`
+                );
+                const pagamentosAprovados = parseInt(pagamentosAprovadosRes.rows[0].total);
+
+                const comissoesRes = await pool.query(
+                    `SELECT 
+                        COALESCE(SUM(valor_comissao), 0) as total_gerado,
+                        COALESCE(SUM(CASE WHEN status = 'PAGO' THEN valor_comissao ELSE 0 END), 0) as total_pago,
+                        COALESCE(SUM(CASE WHEN status = 'PENDENTE' THEN valor_comissao ELSE 0 END), 0) as total_pendente
+                     FROM comissoes_afiliados WHERE affiliate_id = $1`,
+                    [affId]
+                );
+
+                const comissoesData = comissoesRes.rows[0];
+                const totalGerado = parseFloat(comissoesData.total_gerado);
+                const totalPago = parseFloat(comissoesData.total_pago);
+                const totalPendente = parseFloat(comissoesData.total_pendente);
+
+                const listaIndicadosRes = await pool.query(
+                    `SELECT u.telegram_id, u.username, 
+                            (SELECT COUNT(p.id) FROM pagamento_solicitacoes p WHERE p.telegram_id = u.telegram_id AND p.status = 'APPROVED') as aprovados,
+                            (SELECT COALESCE(SUM(c.valor_comissao), 0) FROM comissoes_afiliados c WHERE c.telegram_id = u.telegram_id) as comissao_gerada
+                     FROM usuarios u WHERE u.origem = 'samuel' ORDER BY u.data_cadastro DESC LIMIT 15`
+                );
+
+                let relatorioAfiliado =
+                    `📈 <b>RELATÓRIO DO AFILIADO — SAMUEL</b>\n\n` +
+                    `• Total de pessoas indicadas: <b>${totalIndicados}</b>\n` +
+                    `• Pessoas que já assinaram: <b>${indicadosAssinaram}</b>\n` +
+                    `• Pessoas que ainda não assinaram: <b>${indicadosNaoAssinaram}</b>\n` +
+                    `• Quantidade de pagamentos aprovados: <b>${pagamentosAprovados}</b>\n` +
+                    `• Total de comissões geradas: <b>R$ ${totalGerado.toFixed(2)}</b>\n` +
+                    `• Total de comissões pagas: <b>R$ ${totalPago.toFixed(2)}</b>\n` +
+                    `• Total de comissões pendentes: <b>R$ ${totalPendente.toFixed(2)}</b>\n\n` +
+                    `👥 <b>Últimos usuários indicados:</b>\n`;
+
+                if (listaIndicadosRes.rowCount === 0) {
+                    relatorioAfiliado +='<i>Nenhum usuário indicado até o momento.</i>';
+                } else {
+                    listaIndicadosRes.rows.forEach(row => {
+                        const assinouStr = parseInt(row.aprovados) > 0 ? 'Sim' : 'Não';
+                        relatorioAfiliado += `• @${escapeHtml(row.username || 'N/A')} (<code>${row.telegram_id}</code>) | Assinou: <b>${assinouStr}</b> | Aprovados: ${row.aprovados} | Comissão: R$ ${parseFloat(row.comissao_gerada).toFixed(2)}\n`;
+                    });
+                }
+
+                return bot.sendMessage(chatId, relatorioAfiliado, { parse_mode: 'HTML' });
+            } catch (e) {
+                console.error("Erro no /afiliado:", e);
+                return bot.sendMessage(chatId, "❌ Erro ao consultar o relatório de afiliados.");
+            }
+        }
+
+        // --- COMANDO /COMISSOES (ADMIN) ---
+        if (text === '/comissoes') {
+            if (!isOwner(userId)) {
+                return bot.sendMessage(chatId, "❌ Apenas o administrador pode utilizar este comando.");
+            }
+
+            try {
+                const afRes = await pool.query("SELECT id FROM afiliados WHERE codigo = 'samuel'");
+                if (afRes.rowCount === 0) {
+                    return bot.sendMessage(chatId, "⚠️ Afiliado Samuel não encontrado.");
+                }
+                const affId = afRes.rows[0].id;
+
+                const comissoesRes = await pool.query(
+                    `SELECT c.id, c.telegram_id, c.valor_comissao, c.status, c.created_at, u.username 
+                     FROM comissoes_afiliados c
+                     LEFT JOIN usuarios u ON c.telegram_id = u.telegram_id
+                     WHERE c.affiliate_id = $1
+                     ORDER BY c.created_at DESC LIMIT 20`,
+                    [affId]
+                );
+
+                const totaisRes = await pool.query(
+                    `SELECT 
+                        COALESCE(SUM(CASE WHEN status = 'PENDENTE' THEN valor_comissao ELSE 0 END), 0) as pendente,
+                        COALESCE(SUM(CASE WHEN status = 'PAGO' THEN valor_comissao ELSE 0 END), 0) as pago
+                     FROM comissoes_afiliados WHERE affiliate_id = $1`,
+                    [affId]
+                );
+
+                const tPendente = parseFloat(totaisRes.rows[0].pendente);
+                const tPago = parseFloat(totaisRes.rows[0].pago);
+
+                let respComissoes =
+                    `💰 <b>COMISSÕES DE AFILIADOS — SAMUEL</b>\n\n` +
+                    `• Total Pendente: <b>R$ ${tPendente.toFixed(2)}</b>\n` +
+                    `• Total Pago: <b>R$ ${tPago.toFixed(2)}</b>\n\n` +
+                    `📋 <b>Últimas Comissões:</b>\n`;
+
+                if (comissoesRes.rowCount === 0) {
+                    respComissoes += `<i>Nenhuma comissão registrada.</i>`;
+                } else {
+                    comissoesRes.rows.forEach(c => {
+                        const dataF = new Date(c.created_at).toLocaleString('pt-BR');
+                        const statusEmoji = c.status === 'PAGO' ? '✅' : '⏳';
+                        respComissoes += `• ID: <code>${c.id}</code> | ${statusEmoji} <b>R$ ${parseFloat(c.valor_comissao).toFixed(2)}</b> (${c.status}) | User: @${escapeHtml(c.username || 'N/A')} (<code>${c.telegram_id}</code>) | Data: ${dataF}\n`;
+                    });
+                }
+
+                return bot.sendMessage(chatId, respComissoes, { parse_mode: 'HTML' });
+            } catch (e) {
+                console.error("Erro no /comissoes:", e);
+                return bot.sendMessage(chatId, "❌ Erro ao consultar comissões.");
+            }
+        }
+
+        // --- COMANDO /PAGARCOMISSAO ID (ADMIN) ---
+        if (text.startsWith('/pagarcomissao ')) {
+            if (!isOwner(userId)) {
+                return bot.sendMessage(chatId, "❌ Apenas o administrador pode utilizar este comando.");
+            }
+
+            const comissaoId = parseInt(text.replace('/pagarcomissao', '').trim());
+            if (isNaN(comissaoId)) {
+                return bot.sendMessage(chatId, "⚠️ Use o formato correto: /pagarcomissao [ID]");
+            }
+
+            try {
+                const checkC = await pool.query("SELECT * FROM comissoes_afiliados WHERE id = $1", [comissaoId]);
+                if (checkC.rowCount === 0) {
+                    return bot.sendMessage(chatId, `❌ Comissão com ID ${comissaoId} não foi encontrada.`);
+                }
+
+                const comissao = checkC.rows[0];
+                if (comissao.status === 'PAGO') {
+                    return bot.sendMessage(chatId, `⚠️ Esta comissão (ID ${comissaoId}) já consta como PAGA.`);
+                }
+
+                await pool.query(
+                    "UPDATE comissoes_afiliados SET status = 'PAGO', paid_at = NOW() WHERE id = $1",
+                    [comissaoId]
+                );
+
+                return bot.sendMessage(
+                    chatId,
+                    `✅ <b>Comissão atualizada com sucesso!</b>\nO registro de ID <code>${comissaoId}</code> no valor de R$ ${parseFloat(comissao.valor_comissao).toFixed(2)} foi marcado como <b>PAGO</b>.`,
+                    { parse_mode: 'HTML' }
+                );
+            } catch (e) {
+                console.error("Erro no /pagarcomissao:", e);
+                return bot.sendMessage(chatId, "❌ Erro ao atualizar o status da comissão.");
+            }
         }
 
         // --- COMANDO /ASSINANTES (ADMIN) ---
@@ -861,7 +1102,7 @@ bot.on('callback_query', async (callbackQuery) => {
             }
 
             if (action === 'confirm' && isOwner(userId)) {
-                await pool.query("TRUNCATE TABLE transacoes, usuarios, pagamento_solicitacoes RESTART IDENTITY CASCADE;");
+                await pool.query("TRUNCATE TABLE transacoes, usuarios, pagamento_solicitacoes, comissoes_afiliados RESTART IDENTITY CASCADE;");
                 await bot.answerCallbackQuery(callbackQuery.id, { text: 'Banco zerado!' });
                 return bot.editMessageText('⚠️ <b>BANCO DE DADOS TOTALMENTE ZERADO!</b>\nTodos os dados foram apagados permanentemente.', { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML' });
             }
@@ -961,6 +1202,25 @@ bot.on('callback_query', async (callbackQuery) => {
                          WHERE telegram_id = $1`,
                         [solicitacao.telegram_id]
                     );
+
+                    // --- REGISTRAR COMISSÃO PARA O AFILIADO SAMUEL CASO APLICÁVEL ---
+                    const userOrigemRes = await client.query("SELECT origem FROM usuarios WHERE telegram_id = $1", [solicitacao.telegram_id]);
+                    if (userOrigemRes.rowCount > 0 && userOrigemRes.rows[0].origem === 'samuel') {
+                        const afRes = await client.query("SELECT id FROM afiliados WHERE codigo = 'samuel'");
+                        if (afRes.rowCount > 0) {
+                            const affId = afRes.rows[0].id;
+                            const valorAssinatura = 5.00;
+                            const valorComissao = 1.00; // 20% de R$ 5,00
+
+                            // Insere comissão com restrição UNIQUE na solicitacao_id para evitar duplicidade
+                            await client.query(
+                                `INSERT INTO comissoes_afiliados (affiliate_id, telegram_id, solicitacao_id, valor_assinatura, valor_comissao, status)
+                                 VALUES ($1, $2, $3, $4, $5, 'PENDING')
+                                 ON CONFLICT (solicitacao_id) DO NOTHING`,
+                                [affId, solicitacao.telegram_id, reqId, valorAssinatura, valorComissao]
+                            );
+                        }
+                    }
 
                     await client.query('COMMIT');
 
