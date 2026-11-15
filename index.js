@@ -240,7 +240,6 @@ bot.on('message', async (msg) => {
 
         const usernameSafe = escapeHtml(msg.from.username || 'Usuario');
         
-        // Verifica se usuário já existe para não sobrescrever origem caso já tenha
         const userExists = await pool.query('SELECT origem FROM usuarios WHERE telegram_id = $1', [userId]);
         if (userExists.rowCount === 0) {
             await pool.query(
@@ -279,10 +278,6 @@ bot.on('message', async (msg) => {
                 `• /comissoes — Mostra todas as comissões geradas (pendentes e pagas) detalhando os valores e usuários responsáveis.\n` +
                 `• /pagarcomissao [ID] — Altera o status de uma comissão específica de PENDENTE para PAGO após a realização do Pix manual.\n` +
                 `• /addvip — Inicia o fluxo interativo para promover um usuário ao plano Imperium Plus por 30 dias (renovação acumulativa).\n` +
-                `• /vip [ID] — Promove ou renova diretamente o usuário especificado por ID para o plano VIP por mais 30 dias.\n` +
-                `• /vips — Exibe a lista detalhada de todos os clientes Imperium Plus ativos.\n` +
-                `• /planilha_vip — Exporta uma planilha Excel (.xlsx) contendo apenas os assinantes VIP ativos.\n` +
-                `• /planilha_geral — Exporta uma planilha Excel (.xlsx) com o cadastro completo de todos os usuários e suas origens.\n` +
                 `• /cls — Inicia o processo de limpeza total do banco de dados (exige confirmação interativa de segurança).`;
 
             return bot.sendMessage(chatId, helpText, { parse_mode: 'HTML' });
@@ -354,7 +349,7 @@ bot.on('message', async (msg) => {
                     `👥 <b>Últimos usuários indicados:</b>\n`;
 
                 if (listaIndicadosRes.rowCount === 0) {
-                    relatorioAfiliado +='<i>Nenhum usuário indicado até o momento.</i>';
+                    relatorioAfiliado += '<i>Nenhum usuário indicado até o momento.</i>';
                 } else {
                     listaIndicadosRes.rows.forEach(row => {
                         const assinouStr = parseInt(row.aprovados) > 0 ? 'Sim' : 'Não';
@@ -579,118 +574,6 @@ bot.on('message', async (msg) => {
             );
         }
 
-        // --- /VIP E /VIPS ---
-        if (text.startsWith('/vip ') || text === '/vips') {
-            if (!isOwner(userId)) {
-                return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
-            }
-
-            if (text.startsWith('/vip ')) {
-                const idParaPromover = text.replace('/vip', '').trim();
-                if (!idParaPromover || isNaN(idParaPromover)) {
-                    return bot.sendMessage(chatId, "⚠️ Use: /vip ID");
-                }
-
-                try {
-                    await pool.query(
-                        `UPDATE usuarios 
-                         SET plano = 'VIP', 
-                             vip_expiracao = GREATEST(COALESCE(vip_expiracao, NOW()), NOW()) + INTERVAL '30 days' 
-                         WHERE telegram_id = $1`,
-                        [idParaPromover]
-                    );
-
-                    return bot.sendMessage(
-                        chatId,
-                        `⭐ ID <code>${idParaPromover}</code> promovido/renovado para Imperium Plus por mais 30 dias (acumulado com sucesso)!`,
-                        { parse_mode: 'HTML' }
-                    );
-                } catch (e) {
-                    console.error("Erro no /vip:", e);
-                    return bot.sendMessage(chatId, "❌ Erro no banco ao atualizar VIP.");
-                }
-            }
-
-            if (text === '/vips') {
-                try {
-                    const res = await pool.query(
-                        "SELECT telegram_id, username, vip_expiracao FROM usuarios WHERE plano = 'VIP' AND (vip_expiracao IS NULL OR vip_expiracao >= NOW()) ORDER BY vip_expiracao ASC"
-                    );
-
-                    if (res.rowCount === 0) {
-                        return bot.sendMessage(chatId, "Nenhum usuário Imperium Plus ativo no momento.");
-                    }
-
-                    let lista = "📋 <b>CLIENTES IMPERIUM PLUS ATIVOS:</b>\n\n";
-                    res.rows.forEach(u => {
-                        const dataExp = u.vip_expiracao
-                            ? new Date(u.vip_expiracao).toLocaleDateString('pt-BR')
-                            : "Vitalício/Sem data";
-
-                        lista += `👤 @${escapeHtml(u.username || 'Sem User')} (<code>${u.telegram_id}</code>)\n` +
-                                 `📅 Vence em: <b>${dataExp}</b>\n\n`;
-                    });
-
-                    return bot.sendMessage(chatId, lista, { parse_mode: 'HTML' });
-                } catch (e) {
-                    console.error("Erro no /vips:", e);
-                    return bot.sendMessage(chatId, "❌ Erro ao consultar os usuários VIP.");
-                }
-            }
-        }
-
-        // --- PLANILHAS ---
-        if (text === '/planilha_vip' || text === '/planilha_geral') {
-            if (!isOwner(userId)) {
-                return bot.sendMessage(chatId, "❌ Apenas o dono pode exportar dados.");
-            }
-
-            const queryStr = text === '/planilha_geral'
-                ? "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios"
-                : "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios WHERE plano = 'VIP' AND (vip_expiracao IS NULL OR vip_expiracao >= NOW())";
-
-            const nomeArquivo = text === '/planilha_geral' ? 'Relatorio_Todos_Usuarios.xlsx' : 'Relatorio_Imperium_Plus.xlsx';
-
-            try {
-                const res = await pool.query(queryStr);
-                const workbook = new ExcelJS.Workbook();
-                const worksheet = workbook.addWorksheet('Clientes');
-
-                worksheet.columns = [
-                    { header: 'Telegram ID', key: 'id', width: 20 },
-                    { header: 'Username', key: 'user', width: 20 },
-                    { header: 'Plano', key: 'plano', width: 10 },
-                    { header: 'Origem (Parceiro)', key: 'origem', width: 20 },
-                    { header: 'Data Expiração', key: 'expira', width: 25 },
-                    { header: 'Cadastrado em', key: 'cadastro', width: 25 }
-                ];
-
-                res.rows.forEach(u => {
-                    worksheet.addRow({
-                        id: String(u.telegram_id),
-                        user: u.username || 'N/A',
-                        plano: u.plano,
-                        origem: u.origem || 'organico',
-                        expira: u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleString('pt-BR') : '-',
-                        cadastro: u.data_cadastro ? new Date(u.data_cadastro).toLocaleString('pt-BR') : '-'
-                    });
-                });
-
-                const filePath = `./${nomeArquivo}`;
-                await workbook.xlsx.writeFile(filePath);
-
-                await bot.sendDocument(chatId, filePath, { caption: '📊 Planilha atualizada.' });
-
-                if (fs.existsSync(filePath)) {
-                    fs.unlinkSync(filePath);
-                }
-                return;
-            } catch (e) {
-                console.error("Erro ao gerar planilha:", e);
-                return bot.sendMessage(chatId, "❌ Erro ao gerar a planilha.");
-            }
-        }
-
         // --- COMANDO START ---
         if (text.startsWith('/start') || text === '⬅️ Voltar') {
             delete estados[userId];
@@ -779,7 +662,7 @@ bot.on('message', async (msg) => {
 
             let infoVipAtivo = '';
             if (statusVip.plano === 'VIP') {
-                infoVipAtivo = `\nℹ️ <b>Nota:</b> Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias (acumulativo)!\n`;
+                infoVipAtivo = `\nℹ️ <b>Nota:</b> Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
             }
 
             const plusText =
@@ -1212,7 +1095,6 @@ bot.on('callback_query', async (callbackQuery) => {
                             const valorAssinatura = 5.00;
                             const valorComissao = 1.00; // 20% de R$ 5,00
 
-                            // Insere comissão com restrição UNIQUE na solicitacao_id para evitar duplicidade
                             await client.query(
                                 `INSERT INTO comissoes_afiliados (affiliate_id, telegram_id, solicitacao_id, valor_assinatura, valor_comissao, status)
                                  VALUES ($1, $2, $3, $4, $5, 'PENDING')
@@ -1303,7 +1185,6 @@ async function registrarEEnviarSolicitacao(msg, fileId, fileType) {
     try {
         await client.query('BEGIN');
         
-        // Verifica se já existe solicitação pendente de forma segura (Lock)
         const checkPend = await client.query(
             "SELECT id FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING' FOR UPDATE",
             [chatId]
@@ -1418,7 +1299,7 @@ async function enviarGraficoCompleto(chatId, userId) {
             `📈 <b>Investimentos:</b> R$ ${inv.toFixed(2)}\n` +
             `━━━━━━━━━━━━━━━━━━\n` +
             `💰 <b>Dinheiro Disponível (Conta):</b> R$ ${saldoDisponivel.toFixed(2)}\n` +
-            `🏦 <b>Patrimônio Total:</b> R$ ${patrimonioTotal.toFixed(2)}\n\n` +
+            `🏦 <b>Patrimônio Total:</b> R$ ${patrimônioTotal.toFixed(2)}\n\n` +
             `<i>*Seu Patrimônio Total é a soma do dinheiro na conta mais os seus investimentos.</i>`;
 
         return bot.sendPhoto(chatId, await chart.getShortUrl(), {
