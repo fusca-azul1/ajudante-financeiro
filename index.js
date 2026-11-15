@@ -557,11 +557,12 @@ bot.on('message', async (msg) => {
             }
         }
 
-        // --- ASSINAR IMPERIUM PLUS ---
+        // --- ASSINAR IMPERIUM PLUS (COM BOTÃO DE LINK NUBANK) ---
         if (text === '💎 Assinar Imperium Plus') {
             const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
             const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
             const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
+            const pixPaymentUrl = process.env.PIX_PAYMENT_URL; // Link de cobrança Nubank via variável de ambiente
             const statusVip = await verificarAcesso(userId);
 
             const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
@@ -585,15 +586,22 @@ bot.on('message', async (msg) => {
                 `• Nome: ${receiverName}\n` +
                 `• Descrição: ${description}\n\n` +
                 `💳 <b>Como proceder:</b>\n` +
-                `1. Faça um Pix no valor exato de <b>R$ 5,00</b>.\n` +
-                `2. Clique no botão abaixo para enviar o seu comprovante.`;
+                `1. Clique no botão abaixo para pagar via Pix pelo Nubank, ou copie a chave acima.\n` +
+                `2. Após realizar o pagamento, retorne e clique em "✅ Já realizei o pagamento".`;
+
+            const inlineRows = [];
+            
+            // Adiciona o botão de link do Nubank apenas se a variável estiver configurada
+            if (pixPaymentUrl) {
+                inlineRows.push([{ text: '🔗 Pagar R$ 5,00 via Pix', url: pixPaymentUrl }]);
+            }
+
+            inlineRows.push([{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }]);
+            inlineRows.push([{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]);
 
             const keyboardPlus = {
                 reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }],
-                        [{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]
-                    ]
+                    inline_keyboard: inlineRows
                 }
             };
 
