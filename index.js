@@ -79,7 +79,7 @@ async function garantirUsuario(msg) {
   }
 }
 
-// Menu Principal Dinâmico com Botões Nativos do Telegram
+// Menu Principal Dinâmico com Botões Nativos do Telegram (Inline Keyboards)
 async function enviarMenuPrincipal(chatId, messageId = null) {
   const statusVip = await verificarAcesso(chatId);
   const welcomeText = `🚀 *Bem-vindo ao Imperium Cash!*\n\nO seu assistente financeiro pessoal inteligente.\n\n` +
@@ -112,7 +112,7 @@ async function enviarMenuPrincipal(chatId, messageId = null) {
       });
       return;
     } catch (e) {
-      // Ignora caso não possa editar
+      // Ignora se não puder editar a mensagem anterior
     }
   }
   bot.sendMessage(chatId, welcomeText, { parse_mode: 'Markdown', reply_markup: keyboard });
@@ -133,7 +133,7 @@ bot.onText(/\/(clean|cls)/, (msg) => {
   bot.sendMessage(msg.chat.id, '🧹 Para limpar o chat, utilize a opção do menu do seu aplicativo do Telegram (Limpar histórico).');
 });
 
-// Callback Queries (Gerenciamento de Botões Inline Nativos)
+// Tratamento de Callback Queries (Cliques em Botões Nativos do Telegram)
 bot.on('callback_query', async (callbackQuery) => {
   const msg = callbackQuery.message;
   const chatId = msg.chat.id;
@@ -143,6 +143,7 @@ bot.on('callback_query', async (callbackQuery) => {
   await garantirUsuario({ chat: { id: userId }, from: callbackQuery.from });
 
   if (data === 'minha_conta') {
+    await bot.answerCallbackQuery(callbackQuery.id);
     const statusVip = await verificarAcesso(userId);
     const userRes = await pool.query('SELECT * FROM usuarios WHERE telegram_id = $1', [userId]);
     const txCountRes = await pool.query('SELECT COUNT(*) FROM transacoes WHERE telegram_id = $1 OR user_id = $1', [userId]);
@@ -180,13 +181,13 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 
   else if (data === 'ver_plus') {
+    await bot.answerCallbackQuery(callbackQuery.id);
     const pixKey = process.env.PIX_KEY;
     const receiverName = process.env.PIX_RECEIVER_NAME;
     const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
     const statusVip = await verificarAcesso(userId);
 
     if (!pixKey || !receiverName) {
-      bot.answerCallbackQuery(callbackQuery.id, { text: 'Configuração de pagamento pendente pelo administrador.', show_alert: true });
       if (ownerId && userId === ownerId) {
         bot.sendMessage(userId, '⚠️ *Atenção Administrador:* As variáveis \`PIX_KEY\` e \`PIX_RECEIVER_NAME\` não estão configuradas no arquivo .env.', { parse_mode: 'Markdown' });
       } else {
@@ -198,7 +199,6 @@ bot.on('callback_query', async (callbackQuery) => {
     // Verificar solicitação pendente
     const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
     if (pendRes.rows.length > 0) {
-      bot.answerCallbackQuery(callbackQuery.id, { text: 'Você já possui uma solicitação pendente!', show_alert: true });
       bot.sendMessage(userId, '⏳ Você já enviou um comprovante que está aguardando análise administrativa. Aguarde a confirmação.');
       return;
     }
@@ -220,7 +220,7 @@ bot.on('callback_query', async (callbackQuery) => {
                  `• **Descrição:** ${description}\n\n` +
                  `💳 *Como proceder:*\n` +
                  `1. Faça um Pix no valor exato de **R$ 5,00** para a chave acima.\n` +
-                 `2. Clique no botão abaixo para informar que realizou o pagamento e enviar o comprovante.`;
+                 `2. Clique no botão abaixo para informar que realizou o pagamento.`;
 
     const keyboard = {
       inline_keyboard: [
@@ -239,15 +239,25 @@ bot.on('callback_query', async (callbackQuery) => {
 
   else if (data === 'enviar_comprovante_fluxo') {
     awaitingReceipt.add(userId);
-    bot.answerCallbackQuery(callbackQuery.id);
-    bot.sendMessage(userId, '📥 *Envio de Comprovante*\n\nPor favor, envie agora a **foto** ou o **arquivo PDF** do seu comprovante de pagamento Pix.\n\n*Nota:* O sistema aceita imagens e documentos PDF.', { parse_mode: 'Markdown' });
+    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Envie o comprovante!' });
+    
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '❌ Cancelar', callback_data: 'voltar_inicio' }]
+      ]
+    };
+
+    bot.sendMessage(userId, '📥 *Envio de Comprovante*\n\nPor favor, envie agora a **foto** ou o **arquivo PDF** do seu comprovante de pagamento Pix.\n\n*Nota:* O sistema aceita imagens e documentos PDF.', { parse_mode: 'Markdown', reply_markup: keyboard });
   }
 
   else if (data === 'voltar_inicio') {
+    awaitingReceipt.delete(userId); // Remove do estado de envio caso cancele
+    await bot.answerCallbackQuery(callbackQuery.id);
     await enviarMenuPrincipal(chatId, msg.message_id);
   }
 
   else if (data === 'ajuda_transacoes') {
+    await bot.answerCallbackQuery(callbackQuery.id);
     const text = `💸 *Como Registrar Transações:*\n\n` +
                  `Utilize os comandos diretos no chat:\n` +
                  `• Ganho: \`ganhei [valor] [descrição]\`\n` +
@@ -259,6 +269,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 
   else if (data === 'listar_transacoes') {
+    await bot.answerCallbackQuery(callbackQuery.id);
     try {
       const res = await pool.query('SELECT * FROM transacoes WHERE telegram_id = $1 OR user_id = $1 ORDER BY data DESC LIMIT 10', [userId]);
       if (res.rows.length === 0) {
@@ -291,11 +302,11 @@ bot.on('callback_query', async (callbackQuery) => {
       });
     } catch (err) {
       console.error('Erro ao listar transações:', err);
-      bot.answerCallbackQuery(callbackQuery.id, { text: 'Erro ao carregar histórico.', show_alert: true });
     }
   }
 
   else if (data.startsWith('del_tx_')) {
+    await bot.answerCallbackQuery(callbackQuery.id);
     const txId = parseInt(data.split('_')[2]);
     const keyboard = {
       inline_keyboard: [
@@ -316,7 +327,7 @@ bot.on('callback_query', async (callbackQuery) => {
     const txId = parseInt(data.split('_')[2]);
     try {
       await pool.query('DELETE FROM transacoes WHERE id = $1 AND (telegram_id = $2 OR user_id = $2)', [txId, userId]);
-      bot.answerCallbackQuery(callbackQuery.id, { text: 'Transação excluída com sucesso!' });
+      await bot.answerCallbackQuery(callbackQuery.id, { text: 'Transação excluída com sucesso!' });
       const res = await pool.query('SELECT * FROM transacoes WHERE telegram_id = $1 OR user_id = $1 ORDER BY data DESC LIMIT 10', [userId]);
       if (res.rows.length === 0) {
         bot.editMessageText('📜 Histórico vazio.', { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [[{ text: '↩️ Voltar ao menu', callback_data: 'voltar_inicio' }]] } });
@@ -338,17 +349,14 @@ bot.on('callback_query', async (callbackQuery) => {
       bot.editMessageText(text, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'Markdown', reply_markup: { inline_keyboard: inlineKeyboard } });
     } catch (err) {
       console.error('Erro ao excluir:', err);
-      bot.answerCallbackQuery(callbackQuery.id, { text: 'Erro ao excluir transação.', show_alert: true });
     }
   }
 
   else if (data.startsWith('edit_tx_')) {
+    await bot.answerCallbackQuery(callbackQuery.id);
     const txId = parseInt(data.split('_')[2]);
     const txRes = await pool.query('SELECT * FROM transacoes WHERE id = $1 AND (telegram_id = $2 OR user_id = $2)', [txId, userId]);
-    if (txRes.rows.length === 0) {
-      bot.answerCallbackQuery(callbackQuery.id, { text: 'Transação não encontrada ou sem permissão.', show_alert: true });
-      return;
-    }
+    if (txRes.rows.length === 0) return;
     const tx = txRes.rows[0];
     userStates.set(userId, { action: 'editing', txId: tx.id });
 
@@ -362,10 +370,10 @@ bot.on('callback_query', async (callbackQuery) => {
     bot.editMessageText(text, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'Markdown', reply_markup: keyboard });
   }
 
-  // Ações do Administrador (Aprovar / Rejeitar com botões solicitados)
+  // Ações do Administrador (Botões obrigatórios: ✅ Aprovar pagamento e ❌ Rejeitar pagamento)
   else if (data.startsWith('aprovar_pag_') || data.startsWith('rejeitar_pag_')) {
     if (!ownerId || userId !== ownerId) {
-      bot.answerCallbackQuery(callbackQuery.id, { text: 'Acesso negado. Apenas o administrador.', show_alert: true });
+      await bot.answerCallbackQuery(callbackQuery.id, { text: 'Acesso negado. Apenas o administrador.', show_alert: true });
       return;
     }
 
@@ -381,14 +389,14 @@ bot.on('callback_query', async (callbackQuery) => {
         const reqRes = await client.query('SELECT * FROM pagamento_solicitacoes WHERE id = $1 FOR UPDATE', [reqId]);
         if (reqRes.rows.length === 0) {
           await client.query('ROLLBACK');
-          bot.answerCallbackQuery(callbackQuery.id, { text: 'Solicitação não encontrada.', show_alert: true });
+          await bot.answerCallbackQuery(callbackQuery.id, { text: 'Solicitação não encontrada.', show_alert: true });
           return;
         }
 
         const solicitacao = reqRes.rows[0];
         if (solicitacao.status !== 'PENDING') {
           await client.query('ROLLBACK');
-          bot.answerCallbackQuery(callbackQuery.id, { text: `Esta solicitação já foi processada (${solicitacao.status}).`, show_alert: true });
+          await bot.answerCallbackQuery(callbackQuery.id, { text: `Esta solicitação já foi processada (${solicitacao.status}).`, show_alert: true });
           return;
         }
 
@@ -417,7 +425,7 @@ bot.on('callback_query', async (callbackQuery) => {
           await client.query('COMMIT');
 
           const dataFormatada = novaData.toLocaleDateString('pt-BR');
-          bot.answerCallbackQuery(callbackQuery.id, { text: 'Pagamento aprovado e VIP ativado com sucesso!' });
+          await bot.answerCallbackQuery(callbackQuery.id, { text: 'Pagamento aprovado e VIP ativado!' });
           bot.editMessageCaption(`✅ *SOLICITAÇÃO APROVADA*\nID: \`${reqId}\`\nCliente: ${solicitacao.username} (\`${solicitacao.telegram_id}\`)\nAprovado por Admin em ${new Date().toLocaleString('pt-BR')}`, {
             chat_id: chatId,
             message_id: msg.message_id,
@@ -435,21 +443,21 @@ bot.on('callback_query', async (callbackQuery) => {
 
           await client.query('COMMIT');
 
-          bot.answerCallbackQuery(callbackQuery.id, { text: 'Solicitação rejeitada.' });
+          await bot.answerCallbackQuery(callbackQuery.id, { text: 'Solicitação rejeitada.' });
           bot.editMessageCaption(`❌ *SOLICITAÇÃO REJEITADA*\nID: \`${reqId}\`\nCliente: ${solicitacao.username} (\`${solicitacao.telegram_id}\`)\nRejeitado por Admin em ${new Date().toLocaleString('pt-BR')}`, {
             chat_id: chatId,
             message_id: msg.message_id,
             parse_mode: 'Markdown'
           });
 
-          bot.sendMessage(solicitacao.telegram_id, `⚠️ *Aviso sobre seu pagamento*\n\nSeu comprovante enviado para o Imperium Plus **não foi aprovado**.\n\nPor favor, verifique se o Pix foi realizado corretamente ou entre em contato para enviar um novo comprovante válido.`, { parse_mode: 'Markdown' })
+          bot.sendMessage(solicitacao.telegram_id, `⚠️ *Aviso sobre seu pagamento*\n\nSeu comprovante enviado para o Imperium Plus **não foi aprovado**.\n\nPor favor, verifique se o Pix foi realizado corretamente ou entre em contato com o suporte.`, { parse_mode: 'Markdown' })
              .catch(err => console.error('Erro ao notificar usuário rejeitado:', err));
         }
 
       } catch (err) {
         await client.query('ROLLBACK');
         console.error('Erro na transação de aprovação/rejeição:', err);
-        bot.answerCallbackQuery(callbackQuery.id, { text: 'Erro interno ao processar solicitação.', show_alert: true });
+        await bot.answerCallbackQuery(callbackQuery.id, { text: 'Erro interno ao processar solicitação.', show_alert: true });
       } finally {
         client.release();
       }
@@ -459,7 +467,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-// Recebimento de Comprovantes (Fotos ou Documentos) com Notificação Detalhada ao Admin
+// Recebimento de Comprovantes (Fotos ou Documentos) e Notificação ao Administrador
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
   if (ownerId && chatId === ownerId) return;
@@ -506,7 +514,7 @@ async function registrarEEnviarSolicitacao(msg, fileId, fileType) {
 
     bot.sendMessage(chatId, '✅ *Comprovante recebido!*\n\nSeu pagamento está aguardando análise administrativa. Você receberá uma mensagem assim que a verificação for concluída.', { parse_mode: 'Markdown' });
 
-    // Envio estruturado exigido para o Administrador com botões nativos exatos
+    // Notificação detalhada ao OWNER_ID com os botões inline obrigatórios
     if (ownerId) {
       const captionAdmin = `💰 *NOVA SOLICITAÇÃO DE ASSINATURA*\n\n` +
                            `• **Nome do cliente:** ${nomeCliente}\n` +
@@ -561,7 +569,6 @@ bot.onText(/\/pagamentos/, async (msg) => {
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('Erro ao listar pagamentos:', err);
-    bot.sendMessage(chatId, '❌ Erro ao buscar pagamentos pendentes.');
   }
 });
 
@@ -606,7 +613,6 @@ bot.onText(/\/pagamento (.+)/, async (msg, match) => {
     }
   } catch (err) {
     console.error('Erro ao consultar pagamento:', err);
-    bot.sendMessage(chatId, '❌ Erro ao consultar solicitação.');
   }
 });
 
@@ -672,10 +678,9 @@ bot.onText(/\/rejeitar (\d+)/, async (msg, match) => {
     const solicitacao = res.rows[0];
 
     bot.sendMessage(chatId, `❌ Solicitação #${reqId} rejeitada.`);
-    bot.sendMessage(solicitacao.telegram_id, `⚠️ Seu comprovante do Imperium Plus não foi aprovado. Entre em contato com o suporte ou envie um novo comprovante válido.`, { parse_mode: 'Markdown' });
+    bot.sendMessage(solicitacao.telegram_id, `⚠️ Seu comprovante do Imperium Plus não foi aprovado. Entre em contato com o suporte.`, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error(err);
-    bot.sendMessage(chatId, '❌ Erro ao rejeitar solicitação.');
   }
 });
 
@@ -708,7 +713,6 @@ bot.onText(/\/addvip (\d+) (\d+)/, async (msg, match) => {
     bot.sendMessage(targetId, `🎉 Sua conta recebeu VIP por ${dias} dias! Válido até ${novaData.toLocaleDateString('pt-BR')}.`, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('Erro em /addvip:', err);
-    bot.sendMessage(chatId, '❌ Erro ao adicionar VIP.');
   }
 });
 
@@ -740,7 +744,6 @@ bot.onText(/\/vips/, async (msg) => {
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('Erro em /vips:', err);
-    bot.sendMessage(chatId, '❌ Erro ao listar VIPs.');
   }
 });
 
@@ -770,7 +773,6 @@ bot.onText(/\/planilha_vip/, async (msg) => {
     });
   } catch (err) {
     console.error('Erro em /planilha_vip:', err);
-    bot.sendMessage(chatId, '❌ Erro ao gerar planilha VIP.');
   }
 });
 
@@ -800,7 +802,6 @@ bot.onText(/\/planilha_geral/, async (msg) => {
     });
   } catch (err) {
     console.error('Erro em /planilha_geral:', err);
-    bot.sendMessage(chatId, '❌ Erro ao gerar planilha geral.');
   }
 });
 
@@ -849,7 +850,6 @@ bot.on('message', async (msg) => {
         bot.sendMessage(chatId, `✅ Transação #${state.txId} atualizada com sucesso!`);
       } catch (err) {
         console.error('Erro ao atualizar transação:', err);
-        bot.sendMessage(chatId, '❌ Erro ao atualizar transação no banco de dados.');
       }
       return;
     }
@@ -885,7 +885,6 @@ bot.onText(/(ganhei|gastei|investi)\s+([0-9.,]+)(?:\s+(.*))?/i, async (msg, matc
     bot.sendMessage(chatId, `${emoji} *Transação registrada com sucesso!*\n\nTipo: *${tipo.toUpperCase()}*\nValor: *R$ ${valor.toFixed(2)}*\nDescrição: ${descricao}`, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('Erro ao registrar transação:', err);
-    bot.sendMessage(chatId, '❌ Erro ao salvar transação no banco de dados.');
   }
 });
 
