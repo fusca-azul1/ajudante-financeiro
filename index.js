@@ -909,3 +909,15 @@ async function verificarVencimentosAutomaticos() {
         bot.sendMessage(user.telegram_id, `⚠️ *Aviso de Vencimento*\n\nSua assinatura do **Imperium Plus** vence em **3 dias** (${expDate.toLocaleDateString('pt-BR')}). Renove agora para não perder os benefícios!`, { parse_mode: 'Markdown' })
            .catch(err => console.error(`Erro ao enviar aviso 3 dias para ${user.telegram_id}:`, err));
       } else if (diffDays === 0) {
+        bot.sendMessage(user.telegram_id, `🚨 *Seu VIP vence hoje!*\n\nSua assinatura do **Imperium Plus** expira hoje (${expDate.toLocaleDateString('pt-BR')}). Renove já via Pix para continuar com acesso total.`, { parse_mode: 'Markdown' })
+           .catch(err => console.error(`Erro ao enviar aviso hoje para ${user.telegram_id}:`, err));
+      }
+    }
+  } catch (err) {
+    console.error('Erro na verificação automática de vencimentos:', err);
+  }
+}
+
+setInterval(verificarVencimentosAutomaticos, 12 * 60 * 60 * 1000);
+
+console.log('🤖 Bot Imperium Cash iniciado com sucesso!');
