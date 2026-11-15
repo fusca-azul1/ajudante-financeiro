@@ -426,26 +426,38 @@ bot.on('message', async (msg) => {
                 return bot.sendMessage(chatId, "❌ Apenas o administrador pode utilizar este comando.");
             }
 
-            const comissaoId = parseInt(text.replace('/pagarcomissao', '').trim());
-            if (isNaN(comissaoId)) {
-                return bot.sendMessage(chatId, "⚠️ Use o formato correto: /pagarcomissao [ID]");
+            const arg = text.replace('/pagarcomissao', '').trim();
+            // Validação estrita para aceitar somente IDs numéricos inteiros positivos
+            if (!/^\d+$/.test(arg)) {
+                return bot.sendMessage(chatId, "⚠️ Use o formato correto com ID numérico inteiro: /pagarcomissao [ID]");
             }
+            const comissaoId = parseInt(arg, 10);
 
+            const client = await pool.connect();
             try {
-                const checkC = await pool.query("SELECT * FROM comissoes_afiliados WHERE id = $1", [comissaoId]);
+                await client.query('BEGIN');
+                
+                // Seleciona e bloqueia a linha com FOR UPDATE para evitar execuções simultâneas
+                const checkC = await client.query("SELECT * FROM comissoes_afiliados WHERE id = $1 FOR UPDATE", [comissaoId]);
                 if (checkC.rowCount === 0) {
+                    await client.query('ROLLBACK');
                     return bot.sendMessage(chatId, `❌ Comissão com ID ${comissaoId} não foi encontrada.`);
                 }
 
                 const comissao = checkC.rows[0];
-                if (comissao.status === 'PAGO') {
-                    return bot.sendMessage(chatId, `⚠️ Esta comissão (ID ${comissaoId}) já consta como PAGA.`);
+                
+                // Valida se está pendente estritamente
+                if (comissao.status !== 'PENDENTE') {
+                    await client.query('ROLLBACK');
+                    return bot.sendMessage(chatId, `⚠️ Esta comissão (ID ${comissaoId}) não está pendente (Status atual: ${comissao.status}).`);
                 }
 
-                await pool.query(
+                await client.query(
                     "UPDATE comissoes_afiliados SET status = 'PAGO', paid_at = NOW() WHERE id = $1",
                     [comissaoId]
                 );
+
+                await client.query('COMMIT');
 
                 return bot.sendMessage(
                     chatId,
@@ -453,8 +465,11 @@ bot.on('message', async (msg) => {
                     { parse_mode: 'HTML' }
                 );
             } catch (e) {
+                await client.query('ROLLBACK');
                 console.error("Erro no /pagarcomissao:", e);
                 return bot.sendMessage(chatId, "❌ Erro ao atualizar o status da comissão.");
+            } finally {
+                client.release();
             }
         }
 
@@ -1086,7 +1101,7 @@ bot.on('callback_query', async (callbackQuery) => {
                         [solicitacao.telegram_id]
                     );
 
-                    // --- REGISTRAR COMISSÃO PARA O AFILIADO SAMUEL CASO APLICÁVEL ---
+                    // --- REGISTRAR COMISSÃO PARA O AFILIADO SAMUEL CASO APLICÁVEL (PADRONIZADO COM STATUS PENDENTE) ---
                     const userOrigemRes = await client.query("SELECT origem FROM usuarios WHERE telegram_id = $1", [solicitacao.telegram_id]);
                     if (userOrigemRes.rowCount > 0 && userOrigemRes.rows[0].origem === 'samuel') {
                         const afRes = await client.query("SELECT id FROM afiliados WHERE codigo = 'samuel'");
@@ -1097,7 +1112,7 @@ bot.on('callback_query', async (callbackQuery) => {
 
                             await client.query(
                                 `INSERT INTO comissoes_afiliados (affiliate_id, telegram_id, solicitacao_id, valor_assinatura, valor_comissao, status)
-                                 VALUES ($1, $2, $3, $4, $5, 'PENDING')
+                                 VALUES ($1, $2, $3, $4, $5, 'PENDENTE')
                                  ON CONFLICT (solicitacao_id) DO NOTHING`,
                                 [affId, solicitacao.telegram_id, reqId, valorAssinatura, valorComissao]
                             );
@@ -1299,7 +1314,7 @@ async function enviarGraficoCompleto(chatId, userId) {
             `📈 <b>Investimentos:</b> R$ ${inv.toFixed(2)}\n` +
             `━━━━━━━━━━━━━━━━━━\n` +
             `💰 <b>Dinheiro Disponível (Conta):</b> R$ ${saldoDisponivel.toFixed(2)}\n` +
-            `🏦 <b>Patrimônio Total:</b> R$ ${patrimônioTotal.toFixed(2)}\n\n` +
+            `🏦 <b>Patrimônio Total:</b> R$ ${patrimonioTotal.toFixed(2)}\n\n` +
             `<i>*Seu Patrimônio Total é a soma do dinheiro na conta mais os seus investimentos.</i>`;
 
         return bot.sendPhoto(chatId, await chart.getShortUrl(), {
