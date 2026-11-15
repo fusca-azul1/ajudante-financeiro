@@ -37,12 +37,23 @@ function isOwner(userId) {
     return OWNER_ID !== '' && String(userId).trim() === OWNER_ID;
 }
 
+// --- FUNÇÃO DE SEGURANÇA HTML ---
+function escapeHtml(text) {
+    if (!text) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
 // --- ERROS DO TELEGRAM ---
 bot.on('polling_error', (error) => {
     console.error("❌ Erro no polling do Telegram:", error.message);
 });
 
-// --- INICIALIZAÇÃO DO BANCO ---
+// --- INICIALIZAÇÃO DO BANCO (ROBUSTA) ---
 async function setupDB() {
     try {
         await pool.query(`
@@ -84,19 +95,19 @@ async function setupDB() {
             );
         `);
 
-        console.log("✅ Banco conectado: Gestão original, Imperium Plus, Edição e Limite FREE ativados.");
+        console.log("✅ Banco conectado com sucesso: Tabelas verificadas e prontas.");
         console.log(`🔐 OWNER_ID configurado: ${OWNER_ID ? 'SIM' : 'NÃO'}`);
     } catch (err) {
-        console.error("❌ Erro ao conectar ao banco:", err);
+        console.error("❌ Erro crítico ao conectar ou inicializar o banco de dados:", err);
+        process.exit(1);
     }
 }
 
-setupDB();
-
 const estados = {};
 const awaitingReceipt = new Set();
+const clsConfirmations = new Map(); // Controle de confirmação do comando /cls
 
-// --- INTERFACE ORIGINAL + NOVOS BOTÕES ---
+// --- INTERFACE ---
 const menuPrincipal = {
     reply_markup: {
         keyboard: [
@@ -118,83 +129,88 @@ const tecladoVoltar = {
 
 // --- FUNÇÃO DE ACESSO ---
 async function verificarAcesso(userId) {
-    const res = await pool.query(
-        'SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1',
-        [userId]
-    );
+    try {
+        const res = await pool.query(
+            'SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1',
+            [userId]
+        );
 
-    const user = res.rows[0];
-    let plano = user?.plano || 'FREE';
-    const expiracao = user?.vip_expiracao;
+        const user = res.rows[0];
+        let plano = user?.plano || 'FREE';
+        const expiracao = user?.vip_expiracao;
 
-    if (plano === 'VIP') {
-        if (expiracao && new Date() > new Date(expiracao)) {
-            await pool.query(
-                "UPDATE usuarios SET plano = 'FREE', vip_expiracao = NULL WHERE telegram_id = $1",
-                [userId]
-            );
-
-            plano = 'FREE';
-        } else {
-            return {
-                pode: true,
-                plano: 'VIP'
-            };
+        if (plano === 'VIP') {
+            if (expiracao && new Date() > new Date(expiracao)) {
+                await pool.query(
+                    "UPDATE usuarios SET plano = 'FREE', vip_expiracao = NULL WHERE telegram_id = $1",
+                    [userId]
+                );
+                plano = 'FREE';
+            } else {
+                return { pode: true, plano: 'VIP' };
+            }
         }
+        return { pode: true, plano: 'FREE' };
+    } catch (err) {
+        console.error("Erro ao verificar acesso:", err);
+        return { pode: true, plano: 'FREE' };
     }
-
-    return {
-        pode: true,
-        plano: 'FREE'
-    };
 }
 
-// --- CONVERTER VALOR ---
+// --- CONVERTER VALOR COM VALIDAÇÃO ESTRITA ---
 function parseValor(texto) {
-    let limpo = texto
+    if (!texto) return NaN;
+    let limpo = String(texto)
         .toLowerCase()
         .replace('r$', '')
         .replace(/\s/g, '')
         .trim();
 
+    let val = NaN;
     if (limpo.endsWith('k')) {
-        return parseFloat(
-            limpo.replace('k', '').replace(',', '.')
-        ) * 1000;
+        val = parseFloat(limpo.replace('k', '').replace(',', '.')) * 1000;
+    } else {
+        val = parseFloat(limpo.replace(/\./g, '').replace(',', '.'));
     }
 
-    return parseFloat(
-        limpo.replace(/\./g, '').replace(',', '.')
-    );
+    if (!Number.isFinite(val) || val <= 0) {
+        return NaN;
+    }
+    return val;
 }
 
-// --- LÓGICA DO BOT ---
+// --- LÓGICA PRINCIPAL DO BOT ---
 bot.on('message', async (msg) => {
     try {
         const chatId = msg.chat.id;
         const userId = msg.from.id;
+        const chatType = msg.chat.type;
         const text = msg.text;
 
         if (!text) return;
 
+        // --- PROTEÇÃO DE CHAT PRIVADO ---
+        if (chatType !== 'private') {
+            return bot.sendMessage(
+                chatId,
+                "⚠️ Por questões de segurança e privacidade, o <b>Imperium Cash</b> funciona exclusivamente em mensagens privadas (chat 1 a 1). Por favor, clique no nome do bot e envie uma mensagem direta para mim.",
+                { parse_mode: 'HTML' }
+            );
+        }
+
         // --- SISTEMA DE RASTREAMENTO ---
         let origem = 'organico';
-
         if (text.startsWith('/start ')) {
             origem = text.split(' ')[1];
         }
 
+        const usernameSafe = escapeHtml(msg.from.username || 'Usuario');
         await pool.query(
-            `INSERT INTO usuarios
-            (telegram_id, username, origem)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (telegram_id)
-            DO UPDATE SET username = $2`,
-            [
-                userId,
-                msg.from.username || 'Usuario',
-                origem
-            ]
+            `INSERT INTO usuarios (telegram_id, username, origem)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (telegram_id)
+             DO UPDATE SET username = $2`,
+            [userId, usernameSafe, origem]
         );
 
         // --- MOSTRAR MEU ID ---
@@ -202,23 +218,17 @@ bot.on('message', async (msg) => {
             return bot.sendMessage(
                 chatId,
                 `🆔 Seu ID do Telegram é:\n<code>${userId}</code>`,
-                {
-                    parse_mode: 'HTML'
-                }
+                { parse_mode: 'HTML' }
             );
         }
 
         // --- COMANDO /ASSINANTES (ADMIN) ---
         if (text === '/assinantes') {
             if (!isOwner(userId)) {
-                return bot.sendMessage(
-                    chatId,
-                    "❌ Apenas o administrador pode utilizar este comando."
-                );
+                return bot.sendMessage(chatId, "❌ Apenas o administrador pode utilizar este comando.");
             }
 
             try {
-                // Atualiza expirados para FREE antes de contar, garantindo precisão
                 await pool.query(
                     "UPDATE usuarios SET plano = 'FREE', vip_expiracao = NULL WHERE plano = 'VIP' AND vip_expiracao IS NOT NULL AND vip_expiracao < NOW()"
                 );
@@ -229,9 +239,7 @@ bot.on('message', async (msg) => {
                 const countFreeRes = await pool.query(
                     "SELECT COUNT(*) as total FROM usuarios WHERE plano = 'FREE' OR (plano = 'VIP' AND vip_expiracao < NOW())"
                 );
-                const countTotalRes = await pool.query(
-                    "SELECT COUNT(*) as total FROM usuarios"
-                );
+                const countTotalRes = await pool.query("SELECT COUNT(*) as total FROM usuarios");
 
                 const ativosVip = countVipRes.rows[0].total;
                 const totalFree = countFreeRes.rows[0].total;
@@ -250,206 +258,157 @@ bot.on('message', async (msg) => {
             }
         }
 
+        // --- COMANDO /PAGAMENTOS (ADMIN) ---
+        if (text === '/pagamentos') {
+            if (!isOwner(userId)) {
+                return bot.sendMessage(chatId, "❌ Apenas o administrador pode utilizar este comando.");
+            }
+
+            try {
+                const res = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE status = 'PENDING' ORDER BY created_at ASC");
+                if (res.rowCount === 0) {
+                    return bot.sendMessage(chatId, '📭 Não há solicitações de pagamento pendentes no momento.');
+                }
+
+                let textResp = '📋 <b>Solicitações Pendentes:</b>\n\n';
+                res.rows.forEach(r => {
+                    const dataF = new Date(r.created_at).toLocaleString('pt-BR');
+                    textResp += `• ID: <code>${r.id}</code> | User: ${escapeHtml(r.username)} (<code>${r.telegram_id}</code>) | Data: ${dataF}\n`;
+                });
+                return bot.sendMessage(chatId, textResp, { parse_mode: 'HTML' });
+            } catch (err) {
+                console.error("Erro em /pagamentos:", err);
+                return bot.sendMessage(chatId, "❌ Erro ao consultar pagamentos pendentes.");
+            }
+        }
+
         // --- COMANDO /CLEAN ---
         if (text === '/clean') {
             try {
-                await pool.query(
-                    "DELETE FROM transacoes WHERE user_id = $1",
-                    [userId]
-                );
-
+                await pool.query("DELETE FROM transacoes WHERE user_id = $1", [userId]);
                 return bot.sendMessage(
                     chatId,
                     "🗑️ <b>Histórico limpo!</b> Todos os seus registros foram apagados com sucesso.",
-                    {
-                        parse_mode: 'HTML'
-                    }
+                    { parse_mode: 'HTML' }
                 );
             } catch (e) {
                 console.error("Erro no /clean:", e);
-
-                return bot.sendMessage(
-                    chatId,
-                    "❌ Erro ao limpar histórico."
-                );
+                return bot.sendMessage(chatId, "❌ Erro ao limpar histórico.");
             }
         }
 
-        // --- COMANDO /CLS ---
+        // --- COMANDO /CLS (COM CONFIRMAÇÃO SEGURA) ---
         if (text === '/cls') {
-
             if (!isOwner(userId)) {
-                return bot.sendMessage(
-                    chatId,
-                    "❌ Apenas o dono pode utilizar este comando."
-                );
+                return bot.sendMessage(chatId, "❌ Apenas o dono pode utilizar este comando.");
             }
 
-            try {
-                await pool.query(
-                    "TRUNCATE TABLE transacoes, usuarios, pagamento_solicitacoes RESTART IDENTITY CASCADE;"
-                );
+            const confirmKey = `cls_${userId}_${Date.now()}`;
+            clsConfirmations.set(userId, { key: confirmKey, expires: Date.now() + 300000 }); // 5 min
 
-                return bot.sendMessage(
-                    chatId,
-                    "⚠️ <b>BANCO DE DADOS TOTALMENTE ZERADO!</b>\nTodos os usuários, contas e registros financeiros foram apagados permanentemente.",
-                    {
-                        parse_mode: 'HTML'
-                    }
-                );
-
-            } catch (e) {
-                console.error("Erro no /cls:", e);
-
-                return bot.sendMessage(
-                    chatId,
-                    "❌ Erro ao limpar o banco de dados geral."
-                );
-            }
-        }
-
-        // --- /ADDVIP ---
-        if (text === '/addvip') {
-
-            if (!isOwner(userId)) {
-                return bot.sendMessage(
-                    chatId,
-                    "❌ Apenas o dono pode gerenciar assinaturas."
-                );
-            }
-
-            estados[userId] = {
-                acao: 'pedir_id_vip'
+            const confirmKeyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '⚠️ Sim, apagar TUDO', callback_data: `confirm_cls_${confirmKey}` },
+                            { text: '❌ Cancelar', callback_data: `cancel_cls_${confirmKey}` }
+                        ]
+                    ]
+                }
             };
 
             return bot.sendMessage(
                 chatId,
-                "👤 <b>Adicionar Imperium Plus</b>\n\nEnvie o <b>ID do usuário</b> que você deseja promover (30 dias):",
-                {
-                    parse_mode: 'HTML',
-                    ...tecladoVoltar
-                }
+                "⚠️ <b>ATENÇÃO:</b> Você solicitou a limpeza total do banco de dados (usuários, transações e solicitações). Esta ação é irreversível!\n\nDeseja realmente prosseguir?",
+                { parse_mode: 'HTML', ...confirmKeyboard }
+            );
+        }
+
+        // --- /ADDVIP ---
+        if (text === '/addvip') {
+            if (!isOwner(userId)) {
+                return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
+            }
+
+            estados[userId] = { acao: 'pedir_id_vip' };
+            return bot.sendMessage(
+                chatId,
+                "👤 <b>Adicionar Imperium Plus</b>\n\nEnvie o <b>ID do usuário</b> que você deseja promover (renovação acumulativa):",
+                { parse_mode: 'HTML', ...tecladoVoltar }
             );
         }
 
         // --- /VIP E /VIPS ---
-        if (
-            text.startsWith('/vip ') ||
-            text === '/vips'
-        ) {
-
+        if (text.startsWith('/vip ') || text === '/vips') {
             if (!isOwner(userId)) {
-                return bot.sendMessage(
-                    chatId,
-                    "❌ Apenas o dono pode gerenciar assinaturas."
-                );
+                return bot.sendMessage(chatId, "❌ Apenas o dono pode gerenciar assinaturas.");
             }
 
             if (text.startsWith('/vip ')) {
-                const idParaPromover = text
-                    .replace('/vip', '')
-                    .trim();
-
-                if (
-                    !idParaPromover ||
-                    isNaN(idParaPromover)
-                ) {
-                    return bot.sendMessage(
-                        chatId,
-                        "⚠️ Use: /vip ID"
-                    );
+                const idParaPromover = text.replace('/vip', '').trim();
+                if (!idParaPromover || isNaN(idParaPromover)) {
+                    return bot.sendMessage(chatId, "⚠️ Use: /vip ID");
                 }
 
                 try {
                     await pool.query(
-                        "UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1",
+                        `UPDATE usuarios 
+                         SET plano = 'VIP', 
+                             vip_expiracao = GREATEST(COALESCE(vip_expiracao, NOW()), NOW()) + INTERVAL '30 days' 
+                         WHERE telegram_id = $1`,
                         [idParaPromover]
                     );
 
                     return bot.sendMessage(
                         chatId,
-                        `⭐ ID <code>${idParaPromover}</code> promovido para Imperium Plus por 30 dias!`,
-                        {
-                            parse_mode: 'HTML'
-                        }
+                        `⭐ ID <code>${idParaPromover}</code> promovido/renovado para Imperium Plus por mais 30 dias (acumulado com sucesso)!`,
+                        { parse_mode: 'HTML' }
                     );
-
                 } catch (e) {
                     console.error("Erro no /vip:", e);
-
-                    return bot.sendMessage(
-                        chatId,
-                        "❌ Erro no banco."
-                    );
+                    return bot.sendMessage(chatId, "❌ Erro no banco ao atualizar VIP.");
                 }
             }
 
             if (text === '/vips') {
                 try {
                     const res = await pool.query(
-                        "SELECT telegram_id, username, vip_expiracao FROM usuarios WHERE plano = 'VIP' ORDER BY vip_expiracao ASC"
+                        "SELECT telegram_id, username, vip_expiracao FROM usuarios WHERE plano = 'VIP' AND (vip_expiracao IS NULL OR vip_expiracao >= NOW()) ORDER BY vip_expiracao ASC"
                     );
 
                     if (res.rowCount === 0) {
-                        return bot.sendMessage(
-                            chatId,
-                            "Nenhum usuário Imperium Plus ativo no momento."
-                        );
+                        return bot.sendMessage(chatId, "Nenhum usuário Imperium Plus ativo no momento.");
                     }
 
                     let lista = "📋 <b>CLIENTES IMPERIUM PLUS ATIVOS:</b>\n\n";
-
                     res.rows.forEach(u => {
                         const dataExp = u.vip_expiracao
                             ? new Date(u.vip_expiracao).toLocaleDateString('pt-BR')
-                            : "Sem data";
+                            : "Vitalício/Sem data";
 
-                        lista +=
-                            `👤 @${u.username || 'Sem User'} (<code>${u.telegram_id}</code>)\n` +
-                            `📅 Vence em: <b>${dataExp}</b>\n\n`;
+                        lista += `👤 @${escapeHtml(u.username || 'Sem User')} (<code>${u.telegram_id}</code>)\n` +
+                                 `📅 Vence em: <b>${dataExp}</b>\n\n`;
                     });
 
-                    return bot.sendMessage(
-                        chatId,
-                        lista,
-                        {
-                            parse_mode: 'HTML'
-                        }
-                    );
-
+                    return bot.sendMessage(chatId, lista, { parse_mode: 'HTML' });
                 } catch (e) {
                     console.error("Erro no /vips:", e);
-
-                    return bot.sendMessage(
-                        chatId,
-                        "❌ Erro ao consultar os usuários VIP."
-                    );
+                    return bot.sendMessage(chatId, "❌ Erro ao consultar os usuários VIP.");
                 }
             }
         }
 
         // --- PLANILHAS ---
-        if (
-            text === '/planilha_vip' ||
-            text === '/planilha_geral'
-        ) {
-
+        if (text === '/planilha_vip' || text === '/planilha_geral') {
             if (!isOwner(userId)) {
-                return bot.sendMessage(
-                    chatId,
-                    "❌ Apenas o dono pode exportar dados."
-                );
+                return bot.sendMessage(chatId, "❌ Apenas o dono pode exportar dados.");
             }
 
-            const queryStr =
-                text === '/planilha_geral'
-                    ? "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios"
-                    : "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios WHERE plano = 'VIP'";
+            const queryStr = text === '/planilha_geral'
+                ? "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios"
+                : "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios WHERE plano = 'VIP' AND (vip_expiracao IS NULL OR vip_expiracao >= NOW())";
 
-            const nomeArquivo =
-                text === '/planilha_geral'
-                    ? 'Relatorio_Todos_Usuarios.xlsx'
-                    : 'Relatorio_Imperium_Plus.xlsx';
+            const nomeArquivo = text === '/planilha_geral' ? 'Relatorio_Todos_Usuarios.xlsx' : 'Relatorio_Imperium_Plus.xlsx';
 
             try {
                 const res = await pool.query(queryStr);
@@ -479,27 +438,20 @@ bot.on('message', async (msg) => {
                 const filePath = `./${nomeArquivo}`;
                 await workbook.xlsx.writeFile(filePath);
 
-                await bot.sendDocument(chatId, filePath, {
-                    caption: '📊 Planilha atualizada.'
-                });
+                await bot.sendDocument(chatId, filePath, { caption: '📊 Planilha atualizada.' });
 
                 if (fs.existsSync(filePath)) {
                     fs.unlinkSync(filePath);
                 }
-
                 return;
-
             } catch (e) {
                 console.error("Erro ao gerar planilha:", e);
                 return bot.sendMessage(chatId, "❌ Erro ao gerar a planilha.");
             }
         }
 
-        // --- COMANDO START (ORIGINAL RESTAURADO) ---
-        if (
-            text.startsWith('/start') ||
-            text === '⬅️ Voltar'
-        ) {
+        // --- COMANDO START ---
+        if (text.startsWith('/start') || text === '⬅️ Voltar') {
             delete estados[userId];
             awaitingReceipt.delete(userId);
 
@@ -516,65 +468,45 @@ bot.on('message', async (msg) => {
 
             if (text.startsWith('/start')) {
                 try {
-                    return await bot.sendPhoto(
-                        chatId,
-                        './imperium_cash.jpg',
-                        {
-                            caption: msgStart,
-                            parse_mode: 'HTML',
-                            ...menuPrincipal
-                        }
-                    );
+                    return await bot.sendPhoto(chatId, './imperium_cash.jpg', {
+                        caption: msgStart,
+                        parse_mode: 'HTML',
+                        ...menuPrincipal
+                    });
                 } catch (error) {
-                    return bot.sendMessage(
-                        chatId,
-                        msgStart,
-                        {
-                            parse_mode: 'HTML',
-                            ...menuPrincipal
-                        }
-                    );
+                    return bot.sendMessage(chatId, msgStart, {
+                        parse_mode: 'HTML',
+                        ...menuPrincipal
+                    });
                 }
             }
 
-            return bot.sendMessage(
-                chatId,
-                msgStart,
-                {
-                    parse_mode: 'HTML',
-                    ...menuPrincipal
-                }
-            );
+            return bot.sendMessage(chatId, msgStart, {
+                parse_mode: 'HTML',
+                ...menuPrincipal
+            });
         }
 
         // --- MINHA CONTA ---
         if (text === '👤 Minha Conta') {
             try {
-                const res = await pool.query(
-                    'SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1',
-                    [userId]
-                );
-
-                const count = await pool.query(
-                    'SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1',
-                    [userId]
-                );
+                const res = await pool.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [userId]);
+                const count = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
 
                 const user = res.rows[0];
-
                 let exp = "";
                 let nomePlano = 'Básico (Free)';
 
                 if (user?.plano === 'VIP') {
-                    nomePlano = '👑 Imperium Plus';
-
-                    if (user.vip_expiracao) {
-                        const d = new Date(user.vip_expiracao);
-                        const dia = String(d.getDate()).padStart(2, '0');
-                        const mes = String(d.getMonth() + 1).padStart(2, '0');
-                        const ano = d.getFullYear();
-
-                        exp = `\n\nSeu Imperium Plus expira dia (${dia}/${mes}/${ano})`;
+                    if (!user.vip_expiracao || new Date(user.vip_expiracao) > new Date()) {
+                        nomePlano = '👑 Imperium Plus';
+                        if (user.vip_expiracao) {
+                            const d = new Date(user.vip_expiracao);
+                            const dia = String(d.getDate()).padStart(2, '0');
+                            const mes = String(d.getMonth() + 1).padStart(2, '0');
+                            const ano = d.getFullYear();
+                            exp = `\n\nSeu Imperium Plus expira dia (${dia}/${mes}/${ano})`;
+                        }
                     }
                 }
 
@@ -584,22 +516,14 @@ bot.on('message', async (msg) => {
                     `Plano: <b>${nomePlano}</b>\n` +
                     `Total de Registros: <b>${count.rows[0].total}</b>${exp}`;
 
-                return bot.sendMessage(
-                    chatId,
-                    mensagem,
-                    {
-                        parse_mode: 'HTML',
-                        ...menuPrincipal
-                    }
-                );
-
+                return bot.sendMessage(chatId, mensagem, { parse_mode: 'HTML', ...menuPrincipal });
             } catch (error) {
                 console.error("❌ Erro em Minha Conta:", error);
                 return bot.sendMessage(chatId, "❌ Não foi possível carregar os dados da sua conta.", menuPrincipal);
             }
         }
 
-        // --- ASSINAR IMPERIUM PLUS (COM BOTÃO DE LINK NUBANK) ---
+        // --- ASSINAR IMPERIUM PLUS ---
         if (text === '💎 Assinar Imperium Plus') {
             const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
             const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
@@ -614,42 +538,34 @@ bot.on('message', async (msg) => {
 
             let infoVipAtivo = '';
             if (statusVip.plano === 'VIP') {
-                infoVipAtivo = `\nℹ️ *Nota:* Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
+                infoVipAtivo = `\nℹ️ <b>Nota:</b> Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias (acumulativo)!\n`;
             }
 
             const plusText =
                 `💎 <b>Imperium Plus</b> — Assinatura Mensal\n\n` +
                 `• <b>Preço:</b> R$ 5,00\n` +
                 `• <b>Duração:</b> 30 dias de acesso VIP\n` +
-                `• <b>Benefícios:</b> Gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
+                `• <b>Benefícios:</b> Lançamentos ilimitados, gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
                 `${infoVipAtivo}\n` +
                 `📌 <b>Dados para Pagamento via Pix:</b>\n` +
-                `• Chave Pix: <code>${pixKey}</code>\n` +
-                `• Nome: ${receiverName}\n` +
-                `• Descrição: ${description}\n\n` +
+                `• Chave Pix: <code>${escapeHtml(pixKey)}</code>\n` +
+                `• Nome: ${escapeHtml(receiverName)}\n` +
+                `• Descrição: ${escapeHtml(description)}\n\n` +
                 `💳 <b>Como proceder:</b>\n` +
                 `1. Clique no botão abaixo para pagar via Pix pelo Nubank, ou copie a chave acima.\n` +
                 `2. Após realizar o pagamento, retorne e clique em "✅ Já realizei o pagamento".`;
 
             const inlineRows = [];
-            
             if (pixPaymentUrl) {
                 inlineRows.push([{ text: '🔗 Pagar R$ 5,00 via Pix', url: pixPaymentUrl }]);
             }
-
             inlineRows.push([{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }]);
             inlineRows.push([{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]);
 
-            const keyboardPlus = {
-                reply_markup: {
-                    inline_keyboard: inlineRows
-                }
-            };
-
-            return bot.sendMessage(chatId, plusText, { parse_mode: 'HTML', ...keyboardPlus });
+            return bot.sendMessage(chatId, plusText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: inlineRows } });
         }
 
-        // --- EDITAR LANÇAMENTO (FLUXO CONVERSACIONAL) ---
+        // --- EDITAR LANÇAMENTO ---
         if (text === '✏️ Editar lançamento') {
             try {
                 const res = await pool.query('SELECT * FROM transacoes WHERE user_id = $1 ORDER BY data DESC LIMIT 10', [userId]);
@@ -663,7 +579,7 @@ bot.on('message', async (msg) => {
                     userTxList.push(tx);
                     const valorF = Number(tx.valor).toFixed(2);
                     const tipoFormatado = tx.tipo === 'entrada' ? 'Ganhei' : tx.tipo === 'saida' ? 'Gastei' : 'Investi';
-                    listText += `<b>${idx + 1}.</b> ${tipoFormatado} — R$ ${valorF} — ${tx.descricao}\n`;
+                    listText += `<b>${idx + 1}.</b> ${tipoFormatado} — R$ ${valorF} — ${escapeHtml(tx.descricao)}\n`;
                 });
 
                 estados[userId] = {
@@ -680,27 +596,18 @@ bot.on('message', async (msg) => {
 
         const estado = estados[userId];
 
-        // --- MENU NORMAL / FLUXO PASSO A PASSO ORIGINAL ---
+        // --- MENU NORMAL ---
         if (!estado) {
-
-            if (
-                text === '💸 Gastei' ||
-                text === '💰 Ganhei' ||
-                text === '📈 Investi'
-            ) {
-
+            if (text === '💸 Gastei' || text === '💰 Ganhei' || text === '📈 Investi') {
                 const check = await verificarAcesso(userId);
 
                 if (!check.pode) {
                     return bot.sendMessage(chatId, check.msg, { parse_mode: 'HTML' });
                 }
 
-                // --- VERIFICAÇÃO DE LIMITE DE LANÇAMENTOS PARA PLANO FREE ---
+                // --- VERIFICAÇÃO DE LIMITE DE 15 LANÇAMENTOS PARA FREE ---
                 if (check.plano !== 'VIP') {
-                    const countRes = await pool.query(
-                        'SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1',
-                        [userId]
-                    );
+                    const countRes = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
                     const totalLancamentos = parseInt(countRes.rows[0].total);
 
                     if (totalLancamentos >= 15) {
@@ -752,33 +659,27 @@ bot.on('message', async (msg) => {
             return bot.sendMessage(chatId, "🤖 Use o menu abaixo:", menuPrincipal);
         }
 
-        // --- PEDIR ID VIP ---
+        // --- PEDIR ID VIP (/ADDVIP) ---
         if (estado.acao === 'pedir_id_vip') {
             const idPromover = text.trim();
-
             if (isNaN(idPromover)) {
-                return bot.sendMessage(
-                    chatId,
-                    "⚠️ O ID deve conter apenas números. Tente novamente ou use '⬅️ Voltar':",
-                    tecladoVoltar
-                );
+                return bot.sendMessage(chatId, "⚠️ O ID deve conter apenas números. Tente novamente ou use '⬅️ Voltar':", tecladoVoltar);
             }
 
             try {
                 await pool.query(
-                    "UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1",
+                    `UPDATE usuarios 
+                     SET plano = 'VIP', 
+                         vip_expiracao = GREATEST(COALESCE(vip_expiracao, NOW()), NOW()) + INTERVAL '30 days' 
+                     WHERE telegram_id = $1`,
                     [idPromover]
                 );
 
                 await bot.sendMessage(
                     chatId,
-                    `⭐ Sucesso! O usuário de ID <code>${idPromover}</code> agora possui o Imperium Plus por 30 dias!`,
-                    {
-                        parse_mode: 'HTML',
-                        ...menuPrincipal
-                    }
+                    `⭐ Sucesso! O usuário de ID <code>${idPromover}</code> agora possui o Imperium Plus por mais 30 dias (renovação acumulada)!`,
+                    { parse_mode: 'HTML', ...menuPrincipal }
                 );
-
             } catch (e) {
                 console.error("Erro ao promover usuário:", e);
                 await bot.sendMessage(chatId, "❌ Erro ao promover usuário.", menuPrincipal);
@@ -788,19 +689,18 @@ bot.on('message', async (msg) => {
             return;
         }
 
-        // --- PEDIR VALOR (ORIGINAL) ---
+        // --- PEDIR VALOR ---
         if (estado.acao === 'pedir_valor') {
             const v = parseValor(text);
 
             if (isNaN(v)) {
-                return bot.sendMessage(chatId, "⚠️ Valor inválido. Digite apenas números.", tecladoVoltar);
+                return bot.sendMessage(chatId, "⚠️ Valor inválido. Digite apenas números maiores que zero (ex: 50.00).", tecladoVoltar);
             }
 
             estado.valor = v;
             estado.acao = 'pedir_desc';
 
             let msgDesc = "";
-
             if (estado.tipo === 'entrada') {
                 msgDesc = "De onde veio esse dinheiro? (Ex: Salário, Venda de bolo, Pix do João)";
             } else if (estado.tipo === 'saida') {
@@ -812,18 +712,16 @@ bot.on('message', async (msg) => {
             return bot.sendMessage(chatId, msgDesc, tecladoVoltar);
         }
 
-        // --- PEDIR DESCRIÇÃO E SALVAR (ORIGINAL) ---
+        // --- PEDIR DESCRIÇÃO E SALVAR ---
         if (estado.acao === 'pedir_desc') {
+            const descricaoSegura = escapeHtml(text);
+
             await pool.query(
                 'INSERT INTO transacoes (user_id, tipo, valor, descricao) VALUES ($1, $2, $3, $4)',
-                [userId, estado.tipo, estado.valor, text]
+                [userId, estado.tipo, estado.valor, descricaoSegura]
             );
 
-            const contagemQuery = await pool.query(
-                'SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1',
-                [userId]
-            );
-
+            const contagemQuery = await pool.query('SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1', [userId]);
             const totalRegistros = parseInt(contagemQuery.rows[0].total);
 
             let emojiFinal = '🔴';
@@ -836,10 +734,7 @@ bot.on('message', async (msg) => {
                 `🟢 +1 registro adicionado\n` +
                 `Você está no controle.\n` +
                 `📊 Progresso financeiro: ${totalRegistros} registros feitos.`,
-                {
-                    parse_mode: 'HTML',
-                    ...menuPrincipal
-                }
+                { parse_mode: 'HTML', ...menuPrincipal }
             );
 
             delete estados[userId];
@@ -875,19 +770,19 @@ bot.on('message', async (msg) => {
             if (estado.fieldToEdit === 'tipo') oldVal = estado.selectedTx.tipo;
             if (estado.fieldToEdit === 'data') oldVal = new Date(estado.selectedTx.data).toLocaleDateString('pt-BR');
 
-            return bot.sendMessage(chatId, `Confirma a alteração de "${oldVal}" para "${estado.newValue}"? Responda 'sim' ou 'não'.`, tecladoVoltar);
+            return bot.sendMessage(chatId, `Confirma a alteração de "${escapeHtml(oldVal)}" para "${escapeHtml(estado.newValue)}"? Responda 'sim' ou 'não'.`, tecladoVoltar);
         }
 
         if (estado.acao === 'edit_confirm') {
             if (text.toLowerCase() === 'sim' || text.toLowerCase() === 's') {
                 try {
                     let queryField = 'descricao';
-                    let valToSave = estado.newValue;
+                    let valToSave = escapeHtml(estado.newValue);
 
                     if (estado.fieldToEdit === 'valor') {
                         queryField = 'valor';
                         valToSave = parseValor(estado.newValue);
-                        if (isNaN(valToSave) || valToSave <= 0) {
+                        if (isNaN(valToSave)) {
                             delete estados[userId];
                             return bot.sendMessage(chatId, '⚠️ Valor numérico inválido. Edição cancelada.', menuPrincipal);
                         }
@@ -896,9 +791,19 @@ bot.on('message', async (msg) => {
                         const t = estado.newValue.toLowerCase();
                         if (t.includes('ganh') || t.includes('entrada')) valToSave = 'entrada';
                         else if (t.includes('inv')) valToSave = 'investimento';
-                        else valToSave = 'saida';
+                        else if (t.includes('gast') || t.includes('saída') || t.includes('saida')) valToSave = 'saida';
+                        else {
+                            delete estados[userId];
+                            return bot.sendMessage(chatId, '⚠️ Tipo inválido. Utilize apenas: Ganhei, Gastei ou Investi. Edição cancelada.', menuPrincipal);
+                        }
                     } else if (estado.fieldToEdit === 'data') {
                         queryField = 'data';
+                        const parsedDate = new Date(estado.newValue);
+                        if (isNaN(parsedDate.getTime())) {
+                            delete estados[userId];
+                            return bot.sendMessage(chatId, '⚠️ Data inválida. Edição cancelada.', menuPrincipal);
+                        }
+                        valToSave = parsedDate;
                     }
 
                     await pool.query(
@@ -918,7 +823,6 @@ bot.on('message', async (msg) => {
                 return bot.sendMessage(chatId, '❌ Edição cancelada.', menuPrincipal);
             }
         }
-
     } catch (error) {
         console.error("❌ Erro ao processar mensagem:", error);
         try {
@@ -929,83 +833,104 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- CALLBACK QUERIES (COMPROVANTES E ADMIN) ---
+// --- CALLBACK QUERIES ---
 bot.on('callback_query', async (callbackQuery) => {
     const msg = callbackQuery.message;
     const chatId = msg.chat.id;
     const data = callbackQuery.data;
     const userId = callbackQuery.from.id;
 
-    if (data === 'clique_assinar_plus') {
-        await bot.answerCallbackQuery(callbackQuery.id);
-        const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
-        const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
-        const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
-        const pixPaymentUrl = process.env.PIX_PAYMENT_URL;
-        const statusVip = await verificarAcesso(userId);
+    try {
+        // --- TRATAMENTO DE CONFIRMAÇÃO DO /CLS ---
+        if (data.startsWith('confirm_cls_') || data.startsWith('cancel_cls_')) {
+            const parts = data.split('_');
+            const action = parts[0]; // confirm ou cancel
+            const confirmKey = parts[2] + '_' + parts[3];
 
-        const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
-        if (pendRes.rows.length > 0) {
-            return bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', menuPrincipal);
-        }
-
-        let infoVipAtivo = '';
-        if (statusVip.plano === 'VIP') {
-            infoVipAtivo = `\nℹ️ *Nota:* Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
-        }
-
-        const plusText =
-            `💎 <b>Imperium Plus</b> — Assinatura Mensal\n\n` +
-            `• <b>Preço:</b> R$ 5,00\n` +
-            `• <b>Duração:</b> 30 dias de acesso VIP\n` +
-            `• <b>Benefícios:</b> Gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
-            `${infoVipAtivo}\n` +
-            `📌 <b>Dados para Pagamento via Pix:</b>\n` +
-            `• Chave Pix: <code>${pixKey}</code>\n` +
-            `• Nome: ${receiverName}\n` +
-            `• Descrição: ${description}\n\n` +
-            `💳 <b>Como proceder:</b>\n` +
-            `1. Clique no botão abaixo para pagar via Pix pelo Nubank, ou copie a chave acima.\n` +
-            `2. Após realizar o pagamento, retorne e clique em "✅ Já realizei o pagamento".`;
-
-        const inlineRows = [];
-        if (pixPaymentUrl) {
-            inlineRows.push([{ text: '🔗 Pagar R$ 5,00 via Pix', url: pixPaymentUrl }]);
-        }
-        inlineRows.push([{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }]);
-        inlineRows.push([{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]);
-
-        const keyboardPlus = {
-            reply_markup: {
-                inline_keyboard: inlineRows
+            const stored = clsConfirmations.get(userId);
+            if (!stored || stored.key !== confirmKey || Date.now() > stored.expires) {
+                await bot.answerCallbackQuery(callbackQuery.id, { text: 'Esta solicitação de limpeza expirou.', show_alert: true });
+                return bot.deleteMessage(chatId, msg.message_id).catch(() => {});
             }
-        };
 
-        return bot.sendMessage(chatId, plusText, { parse_mode: 'HTML', ...keyboardPlus });
-    }
+            clsConfirmations.delete(userId);
 
-    if (data === 'enviar_comprovante_fluxo') {
-        awaitingReceipt.add(userId);
-        await bot.answerCallbackQuery(callbackQuery.id, { text: 'Envie o comprovante!' });
-        return bot.sendMessage(userId, '📥 <b>Envio de Comprovante</b>\n\nPor favor, envie agora a foto ou o arquivo PDF do seu comprovante de pagamento Pix.', { parse_mode: 'HTML' });
-    }
+            if (action === 'cancel') {
+                await bot.answerCallbackQuery(callbackQuery.id, { text: 'Operação cancelada.' });
+                return bot.editMessageText('❌ Limpeza do banco de dados cancelada com sucesso.', { chat_id: chatId, message_id: msg.message_id });
+            }
 
-    if (data === 'cancelar_assinatura') {
-        awaitingReceipt.delete(userId);
-        await bot.answerCallbackQuery(callbackQuery.id);
-        return bot.sendMessage(userId, '❌ Processo de assinatura cancelado.', menuPrincipal);
-    }
-
-    if (data.startsWith('aprovar_pag_') || data.startsWith('rejeitar_pag_')) {
-        if (!isOwner(userId)) {
-            return bot.answerCallbackQuery(callbackQuery.id, { text: 'Acesso negado.', show_alert: true });
+            if (action === 'confirm' && isOwner(userId)) {
+                await pool.query("TRUNCATE TABLE transacoes, usuarios, pagamento_solicitacoes RESTART IDENTITY CASCADE;");
+                await bot.answerCallbackQuery(callbackQuery.id, { text: 'Banco zerado!' });
+                return bot.editMessageText('⚠️ <b>BANCO DE DADOS TOTALMENTE ZERADO!</b>\nTodos os dados foram apagados permanentemente.', { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML' });
+            }
+            return;
         }
 
-        const parts = data.split('_');
-        const action = parts[0];
-        const reqId = parseInt(parts[2]);
+        if (data === 'clique_assinar_plus') {
+            await bot.answerCallbackQuery(callbackQuery.id);
+            const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
+            const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
+            const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
+            const pixPaymentUrl = process.env.PIX_PAYMENT_URL;
+            const statusVip = await verificarAcesso(userId);
 
-        try {
+            const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
+            if (pendRes.rows.length > 0) {
+                return bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', menuPrincipal);
+            }
+
+            let infoVipAtivo = '';
+            if (statusVip.plano === 'VIP') {
+                infoVipAtivo = `\nℹ️ <b>Nota:</b> Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
+            }
+
+            const plusText =
+                `💎 <b>Imperium Plus</b> — Assinatura Mensal\n\n` +
+                `• <b>Preço:</b> R$ 5,00\n` +
+                `• <b>Duração:</b> 30 dias de acesso VIP\n` +
+                `• <b>Benefícios:</b> Lançamentos ilimitados, gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
+                `${infoVipAtivo}\n` +
+                `📌 <b>Dados para Pagamento via Pix:</b>\n` +
+                `• Chave Pix: <code>${escapeHtml(pixKey)}</code>\n` +
+                `• Nome: ${escapeHtml(receiverName)}\n` +
+                `• Descrição: ${escapeHtml(description)}\n\n` +
+                `💳 <b>Como proceder:</b>\n` +
+                `1. Clique no botão abaixo para pagar via Pix pelo Nubank, ou copie a chave acima.\n` +
+                `2. Após realizar o pagamento, retorne e clique em "✅ Já realizei o pagamento".`;
+
+            const inlineRows = [];
+            if (pixPaymentUrl) {
+                inlineRows.push([{ text: '🔗 Pagar R$ 5,00 via Pix', url: pixPaymentUrl }]);
+            }
+            inlineRows.push([{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }]);
+            inlineRows.push([{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]);
+
+            return bot.sendMessage(chatId, plusText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: inlineRows } });
+        }
+
+        if (data === 'enviar_comprovante_fluxo') {
+            awaitingReceipt.add(userId);
+            await bot.answerCallbackQuery(callbackQuery.id, { text: 'Envie o comprovante!' });
+            return bot.sendMessage(userId, '📥 <b>Envio de Comprovante</b>\n\nPor favor, envie agora a foto ou o arquivo PDF do seu comprovante de pagamento Pix.', { parse_mode: 'HTML' });
+        }
+
+        if (data === 'cancelar_assinatura') {
+            awaitingReceipt.delete(userId);
+            await bot.answerCallbackQuery(callbackQuery.id);
+            return bot.sendMessage(userId, '❌ Processo de assinatura cancelado.', menuPrincipal);
+        }
+
+        if (data.startsWith('aprovar_pag_') || data.startsWith('rejeitar_pag_')) {
+            if (!isOwner(userId)) {
+                return bot.answerCallbackQuery(callbackQuery.id, { text: 'Acesso negado.', show_alert: true });
+            }
+
+            const parts = data.split('_');
+            const action = parts[0];
+            const reqId = parseInt(parts[2]);
+
             const client = await pool.connect();
             try {
                 await client.query('BEGIN');
@@ -1019,7 +944,7 @@ bot.on('callback_query', async (callbackQuery) => {
                 const solicitacao = reqRes.rows[0];
                 if (solicitacao.status !== 'PENDING') {
                     await client.query('ROLLBACK');
-                    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Já processada.', show_alert: true });
+                    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Esta solicitação já foi processada.', show_alert: true });
                     return;
                 }
 
@@ -1030,7 +955,10 @@ bot.on('callback_query', async (callbackQuery) => {
                     );
 
                     await client.query(
-                        "UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1",
+                        `UPDATE usuarios 
+                         SET plano = 'VIP', 
+                             vip_expiracao = GREATEST(COALESCE(vip_expiracao, NOW()), NOW()) + INTERVAL '30 days' 
+                         WHERE telegram_id = $1`,
                         [solicitacao.telegram_id]
                     );
 
@@ -1038,17 +966,13 @@ bot.on('callback_query', async (callbackQuery) => {
 
                     await bot.answerCallbackQuery(callbackQuery.id, { text: 'Aprovado com sucesso!' });
                     await bot.editMessageCaption(
-                        `✅ <b>SOLICITAÇÃO APROVADA</b>\nID: <code>${reqId}</code>\nCliente: ${solicitacao.username} (<code>${solicitacao.telegram_id}</code>)`,
-                        {
-                            chat_id: chatId,
-                            message_id: msg.message_id,
-                            parse_mode: 'HTML'
-                        }
+                        `✅ <b>SOLICITAÇÃO APROVADA</b>\nID: <code>${reqId}</code>\nCliente: ${escapeHtml(solicitacao.username)} (<code>${solicitacao.telegram_id}</code>)`,
+                        { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML' }
                     );
 
                     await bot.sendMessage(
                         solicitacao.telegram_id,
-                        `🎉 <b>Pagamento Aprovado!</b>\n\nSua assinatura do <b>Imperium Plus</b> foi ativada por 30 dias com sucesso!`,
+                        `🎉 <b>Pagamento Aprovado!</b>\n\nSua assinatura do <b>Imperium Plus</b> foi ativada/renovada por mais 30 dias com sucesso!`,
                         { parse_mode: 'HTML', ...menuPrincipal }
                     );
 
@@ -1062,12 +986,8 @@ bot.on('callback_query', async (callbackQuery) => {
 
                     await bot.answerCallbackQuery(callbackQuery.id, { text: 'Rejeitado.' });
                     await bot.editMessageCaption(
-                        `❌ <b>SOLICITAÇÃO REJEITADA</b>\nID: <code>${reqId}</code>\nCliente: ${solicitacao.username} (<code>${solicitacao.telegram_id}</code>)`,
-                        {
-                            chat_id: chatId,
-                            message_id: msg.message_id,
-                            parse_mode: 'HTML'
-                        }
+                        `❌ <b>SOLICITAÇÃO REJEITADA</b>\nID: <code>${reqId}</code>\nCliente: ${escapeHtml(solicitacao.username)} (<code>${solicitacao.telegram_id}</code>)`,
+                        { chat_id: chatId, message_id: msg.message_id, parse_mode: 'HTML' }
                     );
 
                     await bot.sendMessage(
@@ -1078,21 +998,21 @@ bot.on('callback_query', async (callbackQuery) => {
                 }
             } catch (err) {
                 await client.query('ROLLBACK');
-                console.error(err);
+                console.error("Erro no callback de pagamento:", err);
             } finally {
                 client.release();
             }
-        } catch (err) {
-            console.error(err);
         }
+    } catch (err) {
+        console.error("Erro geral em callback_query:", err);
     }
 });
 
-// --- RECEBIMENTO DE COMPROVANTES (FOTOS / DOCUMENTOS) ---
+// --- RECEBIMENTO DE COMPROVANTES (FOTOS / DOCUMENTOS) COM PROTEÇÃO CONTRA DUPLICIDADE ---
 bot.on('photo', async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    if (isOwner(userId)) return;
+    if (msg.chat.type !== 'private' || isOwner(userId)) return;
 
     if (awaitingReceipt.has(userId)) {
         awaitingReceipt.delete(userId);
@@ -1104,7 +1024,7 @@ bot.on('photo', async (msg) => {
 bot.on('document', async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    if (isOwner(userId)) return;
+    if (msg.chat.type !== 'private' || isOwner(userId)) return;
 
     if (awaitingReceipt.has(userId)) {
         awaitingReceipt.delete(userId);
@@ -1116,17 +1036,33 @@ bot.on('document', async (msg) => {
 async function registrarEEnviarSolicitacao(msg, fileId, fileType) {
     const chatId = msg.chat.id;
     const user = msg.from;
-    const nomeCliente = user.first_name || 'Cliente';
-    const username = user.username ? `@${user.username}` : 'Não disponível';
+    const nomeCliente = escapeHtml(user.first_name || 'Cliente');
+    const username = escapeHtml(user.username ? `@${user.username}` : 'Não disponível');
 
+    const client = await pool.connect();
     try {
-        const res = await pool.query(
+        await client.query('BEGIN');
+        
+        // Verifica se já existe solicitação pendente de forma segura (Lock)
+        const checkPend = await client.query(
+            "SELECT id FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING' FOR UPDATE",
+            [chatId]
+        );
+
+        if (checkPend.rowCount > 0) {
+            await client.query('ROLLBACK');
+            return bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', menuPrincipal);
+        }
+
+        const res = await client.query(
             `INSERT INTO pagamento_solicitacoes (telegram_id, username, valor, status, telegram_file_id, file_type, created_at)
              VALUES ($1, $2, 5.00, 'PENDING', $3, $4, NOW()) RETURNING id`,
             [chatId, username, fileId, fileType]
         );
 
         const reqId = res.rows[0].id;
+        await client.query('COMMIT');
+
         const dataHoraEnvio = new Date().toLocaleString('pt-BR');
 
         await bot.sendMessage(
@@ -1164,52 +1100,24 @@ async function registrarEEnviarSolicitacao(msg, fileId, fileType) {
             }
         }
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Erro ao registrar solicitação de pagamento:', err);
         await bot.sendMessage(chatId, '❌ Ocorreu um erro ao enviar seu comprovante. Tente novamente mais tarde.', menuPrincipal);
+    } finally {
+        client.release();
     }
 }
 
-// --- COMANDO /PAGAMENTOS (ADMIN) ---
-bot.onText(/\/pagamentos/, async (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    if (!isOwner(userId)) return;
-
+// --- GRÁFICO / ANÁLISE ---
+async function enviarGraficoCompleto(chatId, userId) {
     try {
-        const res = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE status = 'PENDING' ORDER BY created_at ASC");
-        if (res.rowCount === 0) {
-            return bot.sendMessage(chatId, '𭭢 Não há solicitações de pagamento pendentes no momento.');
-        }
-
-        let text = '📋 <b>Solicitações Pendentes:</b>\n\n';
-        res.rows.forEach(r => {
-            const dataF = new Date(r.created_at).toLocaleString('pt-BR');
-            text += `• ID: <code>${r.id}</code> | User: ${r.username} (<code>${r.telegram_id}</code>) | Data: ${dataF}\n`;
-        });
-        return bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-    } catch (err) {
-        console.error(err);
-    }
-});
-
-// --- GRÁFICO / ANÁLISE (ORIGINAL RESTAURADO) ---
-async function enviarGraficoCompleto(
-    chatId,
-    userId
-) {
-    try {
-        const res =
-            await pool.query(
-                "SELECT tipo, SUM(valor) as total FROM transacoes WHERE user_id = $1 GROUP BY tipo",
-                [userId]
-            );
+        const res = await pool.query(
+            "SELECT tipo, SUM(valor) as total FROM transacoes WHERE user_id = $1 GROUP BY tipo",
+            [userId]
+        );
 
         if (res.rowCount === 0) {
-            return bot.sendMessage(
-                chatId,
-                "Sem dados suficientes para gerar uma análise.",
-                menuPrincipal
-            );
+            return bot.sendMessage(chatId, "Sem dados suficientes para gerar uma análise.", menuPrincipal);
         }
 
         let gn = 0;
@@ -1217,43 +1125,31 @@ async function enviarGraficoCompleto(
         let inv = 0;
 
         res.rows.forEach(r => {
-            if (r.tipo === 'entrada') {
-                gn = parseFloat(r.total);
-            } else if (r.tipo === 'saida') {
-                gs = parseFloat(r.total);
-            } else if (r.tipo === 'investimento') {
-                inv = parseFloat(r.total);
-            }
+            if (r.tipo === 'entrada') gn = parseFloat(r.total);
+            else if (r.tipo === 'saida') gs = parseFloat(r.total);
+            else if (r.tipo === 'investimento') inv = parseFloat(r.total);
         });
 
         const saldoDisponivel = gn - gs - inv;
         const patrimonioTotal = saldoDisponivel + inv;
 
         const chart = new QuickChart();
-
         chart.setConfig({
             type: 'doughnut',
             data: {
                 labels: ['Ganhos', 'Gastos', 'Investimentos'],
-                datasets: [
-                    {
-                        data: [gn, gs, inv],
-                        backgroundColor: ['#2ecc71', '#e74c3c', '#3498db'],
-                        borderWidth: 2
-                    }
-                ]
+                datasets: [{
+                    data: [gn, gs, inv],
+                    backgroundColor: ['#2ecc71', '#e74c3c', '#3498db'],
+                    borderWidth: 2
+                }]
             },
             options: {
                 plugins: {
-                    legend: {
-                        position: 'bottom',
-                        labels: { fontSize: 16 }
-                    }
+                    legend: { position: 'bottom', labels: { fontSize: 16 } }
                 }
             }
-        })
-        .setWidth(500)
-        .setHeight(350);
+        }).setWidth(500).setHeight(350);
 
         const msgInfo =
             `📊 <b>RESUMO FINANCEIRO DETALHADO</b>\n\n` +
@@ -1265,45 +1161,30 @@ async function enviarGraficoCompleto(
             `🏦 <b>Patrimônio Total:</b> R$ ${patrimonioTotal.toFixed(2)}\n\n` +
             `<i>*Seu Patrimônio Total é a soma do dinheiro na conta mais os seus investimentos.</i>`;
 
-        return bot.sendPhoto(
-            chatId,
-            await chart.getShortUrl(),
-            {
-                caption: msgInfo,
-                parse_mode: 'HTML',
-                ...menuPrincipal
-            }
-        );
-
+        return bot.sendPhoto(chatId, await chart.getShortUrl(), {
+            caption: msgInfo,
+            parse_mode: 'HTML',
+            ...menuPrincipal
+        });
     } catch (error) {
         console.error("❌ Erro na análise:", error);
         return bot.sendMessage(chatId, "❌ Não foi possível gerar a análise financeira.", menuPrincipal);
     }
 }
 
-// --- HISTÓRICO (ORIGINAL RESTAURADO, SEM BOTÕES ANEXADOS) ---
-async function enviarRelatorio(
-    chatId,
-    userId
-) {
+// --- HISTÓRICO ---
+async function enviarRelatorio(chatId, userId) {
     try {
-        const res =
-            await pool.query(
-                "SELECT * FROM transacoes WHERE user_id = $1 ORDER BY data DESC LIMIT 15",
-                [userId]
-            );
+        const res = await pool.query(
+            "SELECT * FROM transacoes WHERE user_id = $1 ORDER BY data DESC LIMIT 15",
+            [userId]
+        );
 
         if (res.rowCount === 0) {
-            return bot.sendMessage(
-                chatId,
-                "Seu histórico está vazio no momento.",
-                menuPrincipal
-            );
+            return bot.sendMessage(chatId, "Seu histórico está vazio no momento.", menuPrincipal);
         }
 
-        let m =
-            "📋 <b>SEUS ÚLTIMOS LANÇAMENTOS:</b>\n" +
-            "━━━━━━━━━━━━━━━━━━━━━━\n";
+        let m = "📋 <b>SEUS ÚLTIMOS LANÇAMENTOS:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n";
 
         res.rows.forEach(t => {
             let icone = '🔴';
@@ -1311,50 +1192,36 @@ async function enviarRelatorio(
             if (t.tipo === 'investimento') icone = '📈';
 
             const d = new Date(t.data);
-            const dataFormatada =
-                `${String(d.getDate()).padStart(2, '0')}/` +
-                `${String(d.getMonth() + 1).padStart(2, '0')}`;
+            const dataFormatada = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}`;
 
-            m +=
-                `${icone} <b>R$ ${parseFloat(t.valor).toFixed(2)}</b> - ` +
-                `${t.descricao} ` +
-                `<i>(${dataFormatada})</i>\n`;
+            m += `${icone} <b>R$ ${parseFloat(t.valor).toFixed(2)}</b> - ${escapeHtml(t.descricao)} <i>(${dataFormatada})</i>\n`;
         });
 
-        m +=
-            "━━━━━━━━━━━━━━━━━━━━━━\n" +
-            "<i>Seu histórico financeiro está organizado aqui.</i>";
+        m += "━━━━━━━━━━━━━━━━━━━━━━\n<i>Seu histórico financeiro está organizado aqui.</i>";
 
-        return bot.sendMessage(
-            chatId,
-            m,
-            {
-                parse_mode: 'HTML',
-                ...menuPrincipal
-            }
-        );
-
+        return bot.sendMessage(chatId, m, { parse_mode: 'HTML', ...menuPrincipal });
     } catch (error) {
         console.error("❌ Erro no histórico:", error);
         return bot.sendMessage(chatId, "❌ Não foi possível carregar seu histórico.", menuPrincipal);
     }
 }
 
-// --- SERVIDOR WEB ---
+// --- SERVIDOR WEB EXPRESS ---
 const app = express();
-
 app.get('/', (req, res) => {
     res.send('Bot Online - Gestão Premium Ativa');
 });
 
-app.listen(
-    process.env.PORT || 3000,
-    () => {
-        console.log(`🌐 Servidor online na porta ${process.env.PORT || 3000}`);
-    }
-);
+const PORT = process.env.PORT || 3000;
 
-// --- PROTEÇÃO CONTRA ERROS ---
+// --- INICIALIZAÇÃO CORRETA: O servidor e o polling só sobem APÓS o banco estar pronto ---
+setupDB().then(() => {
+    app.listen(PORT, () => {
+        console.log(`🌐 Servidor online na porta ${PORT}`);
+    });
+});
+
+// --- PROTEÇÃO CONTRA EXCEÇÕES GLOBAIS ---
 process.on('unhandledRejection', (reason) => {
     console.error("❌ Unhandled Rejection:", reason);
 });
