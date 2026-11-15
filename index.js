@@ -156,14 +156,14 @@ const estados = {};
 const awaitingReceipt = new Set();
 const clsConfirmations = new Map(); // Controle de confirmação do comando /cls
 
-// --- INTERFACE ---
+// --- INTERFACE (COM POSIÇÕES DE BOTÕES AJUSTADAS) ---
 const menuPrincipal = {
     reply_markup: {
         keyboard: [
             ['💰 Ganhei', '💸 Gastei', '📈 Investi'],
             ['📊 Análise', '📄 Histórico', '📊 Exportar Excel'],
-            ['👤 Minha Conta', '💎 Assinar Imperium Plus'],
-            ['✏️ Editar lançamento']
+            ['👤 Minha Conta', '✏️ Editar lançamento'],
+            ['💎 Assinar Imperium Plus']
         ],
         resize_keyboard: true
     }
@@ -175,6 +175,64 @@ const tecladoVoltar = {
         resize_keyboard: true
     }
 };
+
+// --- FUNÇÃO AUXILIAR PARA ENVIAR TELA DE PAGAMENTO PIX (QR CODE / CHAVE) ---
+async function enviarTelaAssinatura(chatId, userId) {
+    const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
+    const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
+    const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
+    const qrPath = process.env.PIX_QR_PATH || path.join(__dirname, 'pix_qr.png');
+    const statusVip = await verificarAcesso(userId);
+
+    const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
+    if (pendRes.rows.length > 0) {
+        return bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', menuPrincipal);
+    }
+
+    let infoVipAtivo = '';
+    if (statusVip.plano === 'VIP') {
+        infoVipAtivo = `\nℹ️ <b>Nota:</b> Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
+    }
+
+    const plusText =
+        `💎 <b>Imperium Plus</b> — Assinatura Mensal\n\n` +
+        `• <b>Preço:</b> R$ 5,00\n` +
+        `• <b>Duração:</b> 30 dias de acesso VIP\n` +
+        `• <b>Benefícios:</b> Lançamentos ilimitados, gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
+        `${infoVipAtivo}\n` +
+        `📌 <b>Dados para Pagamento via Pix:</b>\n` +
+        `• Chave Pix: <code>${escapeHtml(pixKey)}</code>\n` +
+        `• Nome: ${escapeHtml(receiverName)}\n` +
+        `• Descrição: ${escapeHtml(description)}\n\n` +
+        `💳 <b>Como proceder:</b>\n` +
+        `1. Escaneie o QR Code acima ou copie a chave Pix para realizar o pagamento no valor de <b>R$ 5,00</b>.\n` +
+        `2. Após realizar o pagamento, clique em "✅ Já realizei o pagamento" para enviar sua <b>foto, print de tela ou arquivo PDF</b> do comprovante.`;
+
+    const inlineKeyboardRows = [
+        [{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }],
+        [{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]
+    ];
+    const replyMarkup = { reply_markup: { inline_keyboard: inlineKeyboardRows } };
+
+    if (fs.existsSync(qrPath)) {
+        try {
+            return await bot.sendPhoto(chatId, qrPath, {
+                caption: plusText,
+                parse_mode: 'HTML',
+                ...replyMarkup
+            });
+        } catch (err) {
+            console.error("Erro ao enviar imagem QR Code Pix:", err);
+        }
+    }
+
+    // Fallback caso a imagem não esteja disponível
+    const fallbackText = plusText + `\n\n⚠️ <i>QR Code indisponível no momento. Utilize a chave Pix acima para pagar.</i>`;
+    return bot.sendMessage(chatId, fallbackText, {
+        parse_mode: 'HTML',
+        ...replyMarkup
+    });
+}
 
 // --- FUNÇÃO DE ACESSO ---
 async function verificarAcesso(userId) {
@@ -563,7 +621,6 @@ bot.on('message', async (msg) => {
                     return bot.sendMessage(chatId, `⚠️ A comissão de ID <code>${comissaoId}</code> já foi marcada como <b>PAGO</b> anteriormente e não pode ser paga novamente.`, { parse_mode: 'HTML' });
                 }
 
-                // Atualização condicional estrita com PENDENTE e verificação rowCount === 1
                 const updateRes = await client.query(
                     "UPDATE comissoes_afiliados SET status = 'PAGO', paid_at = NOW() WHERE id = $1 AND status = 'PENDENTE' RETURNING id",
                     [comissaoId]
@@ -867,44 +924,7 @@ bot.on('message', async (msg) => {
 
         // --- ASSINAR IMPERIUM PLUS ---
         if (text === '💎 Assinar Imperium Plus') {
-            const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
-            const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
-            const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
-            const pixPaymentUrl = process.env.PIX_PAYMENT_URL;
-            const statusVip = await verificarAcesso(userId);
-
-            const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
-            if (pendRes.rows.length > 0) {
-                return bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', menuPrincipal);
-            }
-
-            let infoVipAtivo = '';
-            if (statusVip.plano === 'VIP') {
-                infoVipAtivo = `\nℹ️ <b>Nota:</b> Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
-            }
-
-            const plusText =
-                `💎 <b>Imperium Plus</b> — Assinatura Mensal\n\n` +
-                `• <b>Preço:</b> R$ 5,00\n` +
-                `• <b>Duração:</b> 30 dias de acesso VIP\n` +
-                `• <b>Benefícios:</b> Lançamentos ilimitados, gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
-                `${infoVipAtivo}\n` +
-                `📌 <b>Dados para Pagamento via Pix:</b>\n` +
-                `• Chave Pix: <code>${escapeHtml(pixKey)}</code>\n` +
-                `• Nome: ${escapeHtml(receiverName)}\n` +
-                `• Descrição: ${escapeHtml(description)}\n\n` +
-                `💳 <b>Como proceder:</b>\n` +
-                `1. Clique no botão abaixo para pagar via Pix pelo Nubank, ou copie a chave acima.\n` +
-                `2. Após realizar o pagamento, retorne e clique em "✅ Já realizei o pagamento" para enviar sua <b>foto, print de tela ou arquivo PDF</b> do comprovante.`;
-
-            const inlineRows = [];
-            if (pixPaymentUrl) {
-                inlineRows.push([{ text: '🔗 Pagar R$ 5,00 via Pix', url: pixPaymentUrl }]);
-            }
-            inlineRows.push([{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }]);
-            inlineRows.push([{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]);
-
-            return bot.sendMessage(chatId, plusText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: inlineRows } });
+            return await enviarTelaAssinatura(chatId, userId);
         }
 
         // --- EXPORTAR EXCEL ---
@@ -1342,44 +1362,7 @@ bot.on('callback_query', async (callbackQuery) => {
 
         if (data === 'clique_assinar_plus') {
             await bot.answerCallbackQuery(callbackQuery.id);
-            const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
-            const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
-            const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
-            const pixPaymentUrl = process.env.PIX_PAYMENT_URL;
-            const statusVip = await verificarAcesso(userId);
-
-            const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
-            if (pendRes.rows.length > 0) {
-                return bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', menuPrincipal);
-            }
-
-            let infoVipAtivo = '';
-            if (statusVip.plano === 'VIP') {
-                infoVipAtivo = `\nℹ️ <b>Nota:</b> Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
-            }
-
-            const plusText =
-                `💎 <b>Imperium Plus</b> — Assinatura Mensal\n\n` +
-                `• <b>Preço:</b> R$ 5,00\n` +
-                `• <b>Duração:</b> 30 dias de acesso VIP\n` +
-                `• <b>Benefícios:</b> Lançamentos ilimitados, gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
-                `${infoVipAtivo}\n` +
-                `📌 <b>Dados para Pagamento via Pix:</b>\n` +
-                `• Chave Pix: <code>${escapeHtml(pixKey)}</code>\n` +
-                `• Nome: ${escapeHtml(receiverName)}\n` +
-                `• Descrição: ${escapeHtml(description)}\n\n` +
-                `💳 <b>Como proceder:</b>\n` +
-                `1. Clique no botão abaixo para pagar via Pix pelo Nubank, ou copie a chave acima.\n` +
-                `2. Após realizar o pagamento, retorne e clique em "✅ Já realizei o pagamento" para enviar sua <b>foto, print de tela ou arquivo PDF</b> do comprovante.`;
-
-            const inlineRows = [];
-            if (pixPaymentUrl) {
-                inlineRows.push([{ text: '🔗 Pagar R$ 5,00 via Pix', url: pixPaymentUrl }]);
-            }
-            inlineRows.push([{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }]);
-            inlineRows.push([{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]);
-
-            return bot.sendMessage(chatId, plusText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: inlineRows } });
+            return await enviarTelaAssinatura(chatId, userId);
         }
 
         if (data === 'enviar_comprovante_fluxo') {
@@ -1441,7 +1424,6 @@ bot.on('callback_query', async (callbackQuery) => {
                 }
 
                 if (action === 'aprovar') {
-                    // Verificação obrigatória de existência do usuário apenas na aprovação
                     const userCheck = await client.query('SELECT telegram_id FROM usuarios WHERE telegram_id = $1', [solicitacaoInfo.telegram_id]);
                     if (userCheck.rowCount === 0) {
                         await client.query('ROLLBACK');
@@ -1487,7 +1469,6 @@ bot.on('callback_query', async (callbackQuery) => {
                     dbCommitted = true;
 
                 } else if (action === 'rejeitar') {
-                    // Na rejeição, não é necessário exigir que o usuário ainda esteja cadastrado
                     await client.query(
                         "UPDATE pagamento_solicitacoes SET status = 'REJECTED', reviewed_at = NOW(), reviewed_by = $1 WHERE id = $2",
                         [userId, reqId]
@@ -1627,7 +1608,6 @@ async function registrarEEnviarSolicitacao(msg, fileId, fileType) {
     try {
         await client.query('BEGIN');
         
-        // Bloqueio transacional seguro por usuário usando pg_advisory_xact_lock para impedir envios simultâneos duplicados
         await client.query('SELECT pg_advisory_xact_lock($1)', [chatId]);
 
         const checkPend = await client.query(
