@@ -84,7 +84,7 @@ async function setupDB() {
             );
         `);
 
-        console.log("✅ Banco conectado: Gestão original, Imperium Plus e Edição ativados.");
+        console.log("✅ Banco conectado: Gestão original, Imperium Plus, Edição e Limite FREE ativados.");
         console.log(`🔐 OWNER_ID configurado: ${OWNER_ID ? 'SIM' : 'NÃO'}`);
     } catch (err) {
         console.error("❌ Erro ao conectar ao banco:", err);
@@ -206,6 +206,48 @@ bot.on('message', async (msg) => {
                     parse_mode: 'HTML'
                 }
             );
+        }
+
+        // --- COMANDO /ASSINANTES (ADMIN) ---
+        if (text === '/assinantes') {
+            if (!isOwner(userId)) {
+                return bot.sendMessage(
+                    chatId,
+                    "❌ Apenas o administrador pode utilizar este comando."
+                );
+            }
+
+            try {
+                // Atualiza expirados para FREE antes de contar, garantindo precisão
+                await pool.query(
+                    "UPDATE usuarios SET plano = 'FREE', vip_expiracao = NULL WHERE plano = 'VIP' AND vip_expiracao IS NOT NULL AND vip_expiracao < NOW()"
+                );
+
+                const countVipRes = await pool.query(
+                    "SELECT COUNT(*) as total FROM usuarios WHERE plano = 'VIP' AND (vip_expiracao IS NULL OR vip_expiracao >= NOW())"
+                );
+                const countFreeRes = await pool.query(
+                    "SELECT COUNT(*) as total FROM usuarios WHERE plano = 'FREE' OR (plano = 'VIP' AND vip_expiracao < NOW())"
+                );
+                const countTotalRes = await pool.query(
+                    "SELECT COUNT(*) as total FROM usuarios"
+                );
+
+                const ativosVip = countVipRes.rows[0].total;
+                const totalFree = countFreeRes.rows[0].total;
+                const totalGeral = countTotalRes.rows[0].total;
+
+                const relatorioAssinantes =
+                    `📊 <b>RELATÓRIO DE ASSINATURAS — IMPERIUM CASH</b>\n\n` +
+                    `• 👑 Assinantes ativos do Imperium Plus: <b>${ativosVip}</b>\n` +
+                    `• 🆓 Usuários no plano FREE: <b>${totalFree}</b>\n` +
+                    `• 👥 Total de usuários cadastrados: <b>${totalGeral}</b>`;
+
+                return bot.sendMessage(chatId, relatorioAssinantes, { parse_mode: 'HTML' });
+            } catch (e) {
+                console.error("Erro no /assinantes:", e);
+                return bot.sendMessage(chatId, "❌ Erro ao consultar o relatório de assinantes.");
+            }
         }
 
         // --- COMANDO /CLEAN ---
@@ -562,7 +604,7 @@ bot.on('message', async (msg) => {
             const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
             const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
             const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
-            const pixPaymentUrl = process.env.PIX_PAYMENT_URL; // Link de cobrança Nubank via variável de ambiente
+            const pixPaymentUrl = process.env.PIX_PAYMENT_URL;
             const statusVip = await verificarAcesso(userId);
 
             const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
@@ -591,7 +633,6 @@ bot.on('message', async (msg) => {
 
             const inlineRows = [];
             
-            // Adiciona o botão de link do Nubank apenas se a variável estiver configurada
             if (pixPaymentUrl) {
                 inlineRows.push([{ text: '🔗 Pagar R$ 5,00 via Pix', url: pixPaymentUrl }]);
             }
@@ -652,6 +693,33 @@ bot.on('message', async (msg) => {
 
                 if (!check.pode) {
                     return bot.sendMessage(chatId, check.msg, { parse_mode: 'HTML' });
+                }
+
+                // --- VERIFICAÇÃO DE LIMITE DE LANÇAMENTOS PARA PLANO FREE ---
+                if (check.plano !== 'VIP') {
+                    const countRes = await pool.query(
+                        'SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1',
+                        [userId]
+                    );
+                    const totalLancamentos = parseInt(countRes.rows[0].total);
+
+                    if (totalLancamentos >= 15) {
+                        const msgLimite =
+                            `🚀 <b>Você atingiu o limite do plano gratuito!</b>\n` +
+                            `Você já utilizou seus 15 lançamentos gratuitos.\n` +
+                            `Com o <b>Imperium Plus</b>, você tem lançamentos ilimitados e pode continuar organizando suas finanças sem restrições.\n` +
+                            `💎 Assine o Imperium Plus para continuar!`;
+
+                        const keyboardAssinar = {
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: '💎 Assinar Imperium Plus', callback_data: 'clique_assinar_plus' }]
+                                ]
+                            }
+                        };
+
+                        return bot.sendMessage(chatId, msgLimite, { parse_mode: 'HTML', ...keyboardAssinar });
+                    }
                 }
 
                 let tipo = 'saida';
@@ -867,6 +935,54 @@ bot.on('callback_query', async (callbackQuery) => {
     const chatId = msg.chat.id;
     const data = callbackQuery.data;
     const userId = callbackQuery.from.id;
+
+    if (data === 'clique_assinar_plus') {
+        await bot.answerCallbackQuery(callbackQuery.id);
+        const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
+        const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
+        const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
+        const pixPaymentUrl = process.env.PIX_PAYMENT_URL;
+        const statusVip = await verificarAcesso(userId);
+
+        const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
+        if (pendRes.rows.length > 0) {
+            return bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', menuPrincipal);
+        }
+
+        let infoVipAtivo = '';
+        if (statusVip.plano === 'VIP') {
+            infoVipAtivo = `\nℹ️ *Nota:* Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
+        }
+
+        const plusText =
+            `💎 <b>Imperium Plus</b> — Assinatura Mensal\n\n` +
+            `• <b>Preço:</b> R$ 5,00\n` +
+            `• <b>Duração:</b> 30 dias de acesso VIP\n` +
+            `• <b>Benefícios:</b> Gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
+            `${infoVipAtivo}\n` +
+            `📌 <b>Dados para Pagamento via Pix:</b>\n` +
+            `• Chave Pix: <code>${pixKey}</code>\n` +
+            `• Nome: ${receiverName}\n` +
+            `• Descrição: ${description}\n\n` +
+            `💳 <b>Como proceder:</b>\n` +
+            `1. Clique no botão abaixo para pagar via Pix pelo Nubank, ou copie a chave acima.\n` +
+            `2. Após realizar o pagamento, retorne e clique em "✅ Já realizei o pagamento".`;
+
+        const inlineRows = [];
+        if (pixPaymentUrl) {
+            inlineRows.push([{ text: '🔗 Pagar R$ 5,00 via Pix', url: pixPaymentUrl }]);
+        }
+        inlineRows.push([{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }]);
+        inlineRows.push([{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]);
+
+        const keyboardPlus = {
+            reply_markup: {
+                inline_keyboard: inlineRows
+            }
+        };
+
+        return bot.sendMessage(chatId, plusText, { parse_mode: 'HTML', ...keyboardPlus });
+    }
 
     if (data === 'enviar_comprovante_fluxo') {
         awaitingReceipt.add(userId);
