@@ -1138,7 +1138,7 @@ async function enviarGraficoCompleto(
             `📈 <b>Investimentos:</b> R$ ${inv.toFixed(2)}\n` +
             `━━━━━━━━━━━━━━━━━━\n` +
             `💰 <b>Dinheiro Disponível (Conta):</b> R$ ${saldoDisponivel.toFixed(2)}\n` +
-            `🏦 <b>Patrimônio Total:</b> R$ ${patrimônioTotal.toFixed(2)}\n\n` +
+            `🏦 <b>Patrimônio Total:</b> R$ ${patrimonioTotal.toFixed(2)}\n\n` +
             `<i>*Seu Patrimônio Total é a soma do dinheiro na conta mais os seus investimentos.</i>`;
 
         return bot.sendPhoto(
