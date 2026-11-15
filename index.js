@@ -13,7 +13,6 @@ if (!token || !connectionString) {
   process.exit(1);
 }
 
-// Configuração do Banco de Dados (Supabase/PostgreSQL com Pooler IPv4)
 const pool = new Pool({
   connectionString,
   ssl: { rejectUnauthorized: false }
@@ -31,17 +30,18 @@ app.listen(PORT, () => {
   console.log(`Servidor Express rodando na porta ${PORT}`);
 });
 
-// Armazenamento em memória temporário para estados
-const awaitingReceipt = new Set();
+// Estados de conversas em memória (Fluxo original passo a passo + Edição + Comprovante)
 const userStates = new Map();
+const awaitingReceipt = new Set();
 
-// Teclado Principal Fixo (Reply Keyboard) original + novo botão de Assinatura
+// Teclado principal original restaurado com os dois novos botões solicitados: 💎 Assinar Imperium Plus e ✏️ Editar lançamento
 const mainReplyKeyboard = {
   reply_markup: {
     keyboard: [
-      ['Ganhei', 'Gastei', 'Investi'],
-      ['Análise', 'Histórico', 'Minha Conta'],
-      ['💎 Assinar Imperium Plus']
+      ['💰 Ganhei', '💸 Gastei'],
+      ['📈 Investi', '📊 Análise'],
+      ['📜 Histórico', '👤 Minha Conta'],
+      ['💎 Assinar Imperium Plus', '✏️ Editar lançamento']
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -92,15 +92,11 @@ async function garantirUsuario(msg) {
   }
 }
 
-// Comando /start
+// Comando /start restaurado fielmente à mensagem inicial original
 bot.onText(/\/start/, async (msg) => {
   await garantirUsuario(msg);
   const chatId = msg.chat.id;
-  const statusVip = await verificarAcesso(chatId);
-  const welcomeText = `🚀 *Bem-vindo ao Imperium Cash!*\n\nO seu assistente financeiro pessoal inteligente.\n\n` +
-                      `Status atual: *${statusVip.ativo ? 'VIP (Imperium Plus) 👑' : 'FREE 🟢'}*\n\n` +
-                      `Utilize os botões abaixo para navegar:`;
-
+  const welcomeText = `🚀 *Bem-vindo ao Imperium Cash!*\n\nO seu assistente financeiro pessoal inteligente.\n\nEscolha uma opção abaixo para começar:`;
   bot.sendMessage(chatId, welcomeText, { parse_mode: 'Markdown', ...mainReplyKeyboard });
 });
 
@@ -113,7 +109,7 @@ bot.onText(/\/(clean|cls)/, (msg) => {
   bot.sendMessage(msg.chat.id, '🧹 Para limpar o chat, utilize a opção do menu do seu aplicativo do Telegram.', mainReplyKeyboard);
 });
 
-// Tratamento de interações por texto do Teclado Fixo
+// Máquina de Estados baseada em conversas passo a passo para Ganhei, Gastei, Investi e Edição
 bot.on('message', async (msg) => {
   if (!msg.text || msg.text.startsWith('/')) return;
   await garantirUsuario(msg);
@@ -121,26 +117,31 @@ bot.on('message', async (msg) => {
   const text = msg.text.trim();
 
   if (text.toLowerCase() === 'cancelar') {
-    awaitingReceipt.delete(chatId);
     userStates.delete(chatId);
+    awaitingReceipt.delete(chatId);
     bot.sendMessage(chatId, '❌ Operação cancelada.', mainReplyKeyboard);
     return;
   }
 
-  // Se o usuário clicou nos botões principais do teclado fixo
-  if (text === 'Ganhei') {
-    bot.sendMessage(chatId, '🟢 *Registrar Ganho*\n\nEnvie no formato:\n`ganhei [valor] [descrição]`\nExemplo: `ganhei 1500 salário`', { parse_mode: 'Markdown', ...mainReplyKeyboard });
+  // 1. Tratamento dos botões do menu principal original
+  if (text === '💰 Ganhei') {
+    userStates.set(chatId, { step: 'ganho_valor' });
+    bot.sendMessage(chatId, 'Quanto você ganhou?', mainReplyKeyboard);
     return;
   }
-  if (text === 'Gastei') {
-    bot.sendMessage(chatId, '🔴 *Registrar Gasto*\n\nEnvie no formato:\n`gastei [valor] [descrição]`\nExemplo: `gastei 45.90 mercado`', { parse_mode: 'Markdown', ...mainReplyKeyboard });
+  if (text === '💸 Gastei') {
+    userStates.set(chatId, { step: 'gasto_valor' });
+    bot.sendMessage(chatId, 'Quanto você gastou?', mainReplyKeyboard);
     return;
   }
-  if (text === 'Investi') {
-    bot.sendMessage(chatId, '🔵 *Registrar Investimento*\n\nEnvie no formato:\n`investi [valor] [descrição]`\nExemplo: `investi 200 acoes`', { parse_mode: 'Markdown', ...mainReplyKeyboard });
+  if (text === '📈 Investi') {
+    userStates.set(chatId, { step: 'investimento_valor' });
+    bot.sendMessage(chatId, 'Quanto você investiu?', mainReplyKeyboard);
     return;
   }
-  if (text === 'Análise') {
+
+  // 2. Apresentação original da Análise
+  if (text === '📊 Análise') {
     try {
       const res = await pool.query('SELECT tipo, SUM(valor) as total FROM transacoes WHERE telegram_id = $1 OR user_id = $1 GROUP BY tipo', [chatId]);
       let ganhos = 0, gastos = 0, investimentos = 0;
@@ -150,19 +151,21 @@ bot.on('message', async (msg) => {
         if (r.tipo === 'investimento') investimentos = Number(r.total);
       });
       const saldo = ganhos - gastos - investimentos;
-      const textAnise = `📊 *Sua Análise Financeira*\n\n` +
-                        `🟢 Total Ganho: R$ ${ganhos.toFixed(2)}\n` +
-                        `🔴 Total Gasto: R$ ${gastos.toFixed(2)}\n` +
-                        `🔵 Total Investido: R$ ${investimentos.toFixed(2)}\n` +
-                        `💰 *Saldo Líquido:* R$ ${saldo.toFixed(2)}`;
-      bot.sendMessage(chatId, textAnise, { parse_mode: 'Markdown', ...mainReplyKeyboard });
+      const analysisText = `📊 *Sua Análise Financeira*\n\n` +
+                           `🟢 Total Ganho: R$ ${ganhos.toFixed(2)}\n` +
+                           `🔴 Total Gasto: R$ ${gastos.toFixed(2)}\n` +
+                           `🔵 Total Investido: R$ ${investimentos.toFixed(2)}\n` +
+                           `💰 *Saldo Líquido:* R$ ${saldo.toFixed(2)}`;
+      bot.sendMessage(chatId, analysisText, { parse_mode: 'Markdown', ...mainReplyKeyboard });
     } catch (err) {
       console.error('Erro na análise:', err);
       bot.sendMessage(chatId, '❌ Erro ao carregar análise.', mainReplyKeyboard);
     }
     return;
   }
-  if (text === 'Histórico') {
+
+  // 3. Apresentação original do Histórico (limpo e sem botões inline por lançamento)
+  if (text === '📜 Histórico') {
     try {
       const res = await pool.query('SELECT * FROM transacoes WHERE telegram_id = $1 OR user_id = $1 ORDER BY data DESC LIMIT 10', [chatId]);
       if (res.rows.length === 0) {
@@ -170,26 +173,21 @@ bot.on('message', async (msg) => {
         return;
       }
       let histText = '📜 *Suas Últimas 10 Transações:*\n\n';
-      const inlineKeyboard = [];
       res.rows.forEach((tx, idx) => {
         const dataF = new Date(tx.data).toLocaleDateString('pt-BR');
         const valorF = Number(tx.valor).toFixed(2);
         const tipoEmoji = tx.tipo === 'ganho' ? '🟢' : tx.tipo === 'investimento' ? '🔵' : '🔴';
         histText += `${idx + 1}. ${tipoEmoji} *${tx.tipo.toUpperCase()}* | R$ ${valorF} | ${tx.descricao} (${dataF})\n`;
-        inlineKeyboard.push([
-          { text: `✏️ Editar #${tx.id}`, callback_data: `edit_tx_${tx.id}` },
-          { text: `🗑️ Excluir #${tx.id}`, callback_data: `del_tx_${tx.id}` }
-        ]);
       });
-      bot.sendMessage(chatId, histText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inlineKeyboard } });
-      bot.sendMessage(chatId, 'Para voltar ao menu, use o teclado abaixo:', mainReplyKeyboard);
+      bot.sendMessage(chatId, histText, { parse_mode: 'Markdown', ...mainReplyKeyboard });
     } catch (err) {
-      console.error('Erro ao listar:', err);
+      console.error('Erro ao listar histórico:', err);
       bot.sendMessage(chatId, '❌ Erro ao carregar histórico.', mainReplyKeyboard);
     }
     return;
   }
-  if (text === 'Minha Conta') {
+
+  if (text === '👤 Minha Conta') {
     const statusVip = await verificarAcesso(chatId);
     const userRes = await pool.query('SELECT * FROM usuarios WHERE telegram_id = $1', [chatId]);
     const txCountRes = await pool.query('SELECT COUNT(*) FROM transacoes WHERE telegram_id = $1 OR user_id = $1', [chatId]);
@@ -212,6 +210,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // 4. Fluxo de Assinatura VIP
   if (text === '💎 Assinar Imperium Plus') {
     const pixKey = process.env.PIX_KEY;
     const receiverName = process.env.PIX_RECEIVER_NAME;
@@ -259,45 +258,222 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Tratamento de estados (edição de transações)
+  // 5. Novo botão: ✏️ Editar lançamento (Por conversa, sem botões embaixo do histórico)
+  if (text === '✏️ Editar lançamento') {
+    try {
+      const res = await pool.query('SELECT * FROM transacoes WHERE telegram_id = $1 OR user_id = $1 ORDER BY data DESC LIMIT 10', [chatId]);
+      if (res.rows.length === 0) {
+        bot.sendMessage(chatId, '📜 Nenhuma transação encontrada para edição.', mainReplyKeyboard);
+        return;
+      }
+      let listText = 'Qual lançamento você deseja editar?\n\n';
+      const userTxList = [];
+      res.rows.forEach((tx, idx) => {
+        userTxList.push(tx);
+        const valorF = Number(tx.valor).toFixed(2);
+        listText += `${idx + 1}. ${tx.tipo.toUpperCase()} — R$ ${valorF} — ${tx.descricao}\n`;
+      });
+      userStates.set(chatId, { step: 'edit_select_tx', txList: userTxList });
+      bot.sendMessage(chatId, listText, mainReplyKeyboard);
+    } catch (err) {
+      console.error('Erro ao listar para edição:', err);
+      bot.sendMessage(chatId, '❌ Erro ao carregar lançamentos.', mainReplyKeyboard);
+    }
+    return;
+  }
+
+  // Máquina de estados conversacional para Ganhei, Gastei, Investi e Edição
   if (userStates.has(chatId)) {
     const state = userStates.get(chatId);
-    if (state.action === 'editing') {
-      const parts = text.split(/\s+/);
-      if (parts.length < 2) {
-        bot.sendMessage(chatId, '⚠️ Formato inválido. Use: `[tipo] [valor] [descrição]`', mainReplyKeyboard);
-        return;
-      }
-      const tipoBruto = parts[0].toLowerCase();
-      let tipo = 'gasto';
-      if (tipoBruto.startsWith('ganh')) tipo = 'ganho';
-      if (tipoBruto.startsWith('inv')) tipo = 'investimento';
 
-      const valor = parseFloat(parts[1].replace(',', '.'));
-      const descricao = parts.slice(2).join(' ') || 'Sem descrição';
-
+    // Fluxo Ganhei (Passo 1: Valor -> Passo 2: Descrição -> Passo 3: Confirmação)
+    if (state.step === 'ganho_valor') {
+      const valor = parseFloat(text.replace(',', '.'));
       if (isNaN(valor) || valor <= 0) {
-        bot.sendMessage(chatId, '⚠️ Valor numérico inválido.', mainReplyKeyboard);
+        bot.sendMessage(chatId, '⚠️ Valor inválido. Informe um número válido:', mainReplyKeyboard);
         return;
       }
-
-      try {
-        await pool.query(
-          'UPDATE transacoes SET tipo = $1, valor = $2, descricao = $3 WHERE id = $4 AND (telegram_id = $5 OR user_id = $5)',
-          [tipo, valor, descricao, state.txId, chatId]
-        );
+      state.valor = valor;
+      state.step = 'ganho_desc';
+      bot.sendMessage(chatId, 'Como você ganhou esse dinheiro?', mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'ganho_desc') {
+      state.descricao = text;
+      state.step = 'ganho_conf';
+      bot.sendMessage(chatId, `Confirma o lançamento de R$ ${state.valor.toFixed(2)} referente a ${state.descricao}? Responda 'sim' ou 'não'.`, mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'ganho_conf') {
+      if (text.toLowerCase() === 'sim') {
+        try {
+          await pool.query(
+            'INSERT INTO transacoes (telegram_id, user_id, tipo, valor, descricao, data) VALUES ($1, $1, $2, $3, $4, NOW())',
+            [chatId, 'ganho', state.valor, state.descricao]
+          );
+          userStates.delete(chatId);
+          bot.sendMessage(chatId, '🟢 Transação registrada com sucesso!', mainReplyKeyboard);
+        } catch (err) {
+          console.error(err);
+          bot.sendMessage(chatId, '❌ Erro ao salvar transação.', mainReplyKeyboard);
+        }
+      } else {
         userStates.delete(chatId);
-        bot.sendMessage(chatId, `✅ Transação #${state.txId} atualizada com sucesso!`, mainReplyKeyboard);
-      } catch (err) {
-        console.error('Erro ao atualizar:', err);
-        bot.sendMessage(chatId, '❌ Erro ao atualizar transação.', mainReplyKeyboard);
+        bot.sendMessage(chatId, '❌ Lançamento cancelado.', mainReplyKeyboard);
+      }
+      return;
+    }
+
+    // Fluxo Gastei
+    if (state.step === 'gasto_valor') {
+      const valor = parseFloat(text.replace(',', '.'));
+      if (isNaN(valor) || valor <= 0) {
+        bot.sendMessage(chatId, '⚠️ Valor inválido. Informe um número válido:', mainReplyKeyboard);
+        return;
+      }
+      state.valor = valor;
+      state.step = 'gasto_desc';
+      bot.sendMessage(chatId, 'Com que você gastou esse dinheiro?', mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'gasto_desc') {
+      state.descricao = text;
+      state.step = 'gasto_conf';
+      bot.sendMessage(chatId, `Confirma o lançamento de R$ ${state.valor.toFixed(2)} referente a ${state.descricao}? Responda 'sim' ou 'não'.`, mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'gasto_conf') {
+      if (text.toLowerCase() === 'sim') {
+        try {
+          await pool.query(
+            'INSERT INTO transacoes (telegram_id, user_id, tipo, valor, descricao, data) VALUES ($1, $1, $2, $3, $4, NOW())',
+            [chatId, 'gasto', state.valor, state.descricao]
+          );
+          userStates.delete(chatId);
+          bot.sendMessage(chatId, '🔴 Transação registrada com sucesso!', mainReplyKeyboard);
+        } catch (err) {
+          console.error(err);
+          bot.sendMessage(chatId, '❌ Erro ao salvar transação.', mainReplyKeyboard);
+        }
+      } else {
+        userStates.delete(chatId);
+        bot.sendMessage(chatId, '❌ Lançamento cancelado.', mainReplyKeyboard);
+      }
+      return;
+    }
+
+    // Fluxo Investi
+    if (state.step === 'investimento_valor') {
+      const valor = parseFloat(text.replace(',', '.'));
+      if (isNaN(valor) || valor <= 0) {
+        bot.sendMessage(chatId, '⚠️ Valor inválido. Informe um número válido:', mainReplyKeyboard);
+        return;
+      }
+      state.valor = valor;
+      state.step = 'investimento_desc';
+      bot.sendMessage(chatId, 'Onde você investiu esse dinheiro?', mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'investimento_desc') {
+      state.descricao = text;
+      state.step = 'investimento_conf';
+      bot.sendMessage(chatId, `Confirma o lançamento de R$ ${state.valor.toFixed(2)} referente a ${state.descricao}? Responda 'sim' ou 'não'.`, mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'investimento_conf') {
+      if (text.toLowerCase() === 'sim') {
+        try {
+          await pool.query(
+            'INSERT INTO transacoes (telegram_id, user_id, tipo, valor, descricao, data) VALUES ($1, $1, $2, $3, $4, NOW())',
+            [chatId, 'investimento', state.valor, state.descricao]
+          );
+          userStates.delete(chatId);
+          bot.sendMessage(chatId, '🔵 Transação registrada com sucesso!', mainReplyKeyboard);
+        } catch (err) {
+          console.error(err);
+          bot.sendMessage(chatId, '❌ Erro ao salvar transação.', mainReplyKeyboard);
+        }
+      } else {
+        userStates.delete(chatId);
+        bot.sendMessage(chatId, '❌ Lançamento cancelado.', mainReplyKeyboard);
+      }
+      return;
+    }
+
+    // Fluxo de Edição por Conversa (Seguro por ID do usuário)
+    if (state.step === 'edit_select_tx') {
+      const index = parseInt(text) - 1;
+      if (isNaN(index) || !state.txList[index]) {
+        bot.sendMessage(chatId, '⚠️ Número inválido. Escolha um número válido da lista:', mainReplyKeyboard);
+        return;
+      }
+      state.selectedTx = state.txList[index];
+      state.step = 'edit_select_field';
+      bot.sendMessage(chatId, 'Qual informação deseja alterar? (Digite: Valor, Descrição, Tipo ou Data)', mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'edit_select_field') {
+      const field = text.toLowerCase();
+      if (!['valor', 'descrição', 'descricao', 'tipo', 'data'].includes(field)) {
+        bot.sendMessage(chatId, '⚠️ Opção inválida. Escolha entre: Valor, Descrição, Tipo ou Data', mainReplyKeyboard);
+        return;
+      }
+      state.fieldToEdit = field.replace('descricao', 'descrição');
+      state.step = 'edit_get_new_value';
+      bot.sendMessage(chatId, `Informe o novo valor para ${state.fieldToEdit}:`, mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'edit_get_new_value') {
+      state.newValue = text;
+      state.step = 'edit_confirm';
+      const oldVal = state.fieldToEdit === 'valor' ? `R$ ${Number(state.selectedTx.valor).toFixed(2)}` : state.selectedTx[state.fieldToEdit === 'descrição' ? 'descricao' : state.fieldToEdit];
+      bot.sendMessage(chatId, `Confirme a alteração de ${oldVal} para ${state.newValue}? Responda 'sim' ou 'não'.`, mainReplyKeyboard);
+      return;
+    }
+    if (state.step === 'edit_confirm') {
+      if (text.toLowerCase() === 'sim') {
+        try {
+          let queryField = 'descricao';
+          let valToSave = state.newValue;
+
+          if (state.fieldToEdit === 'valor') {
+            queryField = 'valor';
+            valToSave = parseFloat(state.newValue.replace(',', '.'));
+            if (isNaN(valToSave) || valToSave <= 0) {
+              bot.sendMessage(chatId, '⚠️ Valor numérico inválido. Edição cancelada.', mainReplyKeyboard);
+              userStates.delete(chatId);
+              return;
+            }
+          } else if (state.fieldToEdit === 'tipo') {
+            queryField = 'tipo';
+            const t = state.newValue.toLowerCase();
+            if (t.includes('ganh')) valToSave = 'ganho';
+            else if (t.includes('inv')) valToSave = 'investimento';
+            else valToSave = 'gasto';
+          } else if (state.fieldToEdit === 'data') {
+            queryField = 'data';
+          }
+
+          await pool.query(
+            `UPDATE transacoes SET ${queryField} = $1 WHERE id = $2 AND (telegram_id = $3 OR user_id = $3)`,
+            [valToSave, state.selectedTx.id, chatId]
+          );
+          userStates.delete(chatId);
+          bot.sendMessage(chatId, '✅ Registro atualizado com sucesso!', mainReplyKeyboard);
+        } catch (err) {
+          console.error(err);
+          bot.sendMessage(chatId, '❌ Erro ao atualizar registro.', mainReplyKeyboard);
+        }
+      } else {
+        userStates.delete(chatId);
+        bot.sendMessage(chatId, '❌ Edição cancelada.', mainReplyKeyboard);
       }
       return;
     }
   }
 });
 
-// Tratamento de Callback Queries (Inline buttons para assinatura e histórico)
+// Tratamento de Callback Queries (Assinatura VIP e Painel do Administrador)
 bot.on('callback_query', async (callbackQuery) => {
   const msg = callbackQuery.message;
   const chatId = msg.chat.id;
@@ -308,53 +484,16 @@ bot.on('callback_query', async (callbackQuery) => {
 
   if (data === 'enviar_comprovante_fluxo') {
     awaitingReceipt.add(userId);
-    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Envie o comprovante agora!' });
-    bot.sendMessage(userId, '📥 *Envio de Comprovante*\n\nPor favor, envie a foto ou documento PDF do seu comprovante de pagamento Pix.', { parse_mode: 'Markdown' });
+    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Envie o comprovante!' });
+    bot.sendMessage(userId, '📥 *Envio de Comprovante*\n\nPor favor, envie agora a foto ou o arquivo PDF do seu comprovante de pagamento Pix.', { parse_mode: 'Markdown' });
   }
 
-  else if (data === 'cancelar_assinatura' || data === 'voltar_inicio') {
+  else if (data === 'cancelar_assinatura') {
     awaitingReceipt.delete(userId);
     await bot.answerCallbackQuery(callbackQuery.id);
     bot.sendMessage(userId, '❌ Processo de assinatura cancelado.', mainReplyKeyboard);
   }
 
-  else if (data.startsWith('del_tx_')) {
-    await bot.answerCallbackQuery(callbackQuery.id);
-    const txId = parseInt(data.split('_')[2]);
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: '✅ Sim, excluir', callback_data: `confirm_del_${txId}` },
-          { text: '❌ Cancelar', callback_data: 'voltar_inicio' }
-        ]
-      ]
-    };
-    bot.sendMessage(chatId, `⚠️ Tem certeza que deseja excluir permanentemente a transação #${txId}?`, { reply_markup: keyboard });
-  }
-
-  else if (data.startsWith('confirm_del_')) {
-    const txId = parseInt(data.split('_')[2]);
-    try {
-      await pool.query('DELETE FROM transacoes WHERE id = $1 AND (telegram_id = $2 OR user_id = $2)', [txId, userId]);
-      await bot.answerCallbackQuery(callbackQuery.id, { text: 'Excluído com sucesso!' });
-      bot.sendMessage(userId, '🗑️ Transação excluída com sucesso!', mainReplyKeyboard);
-    } catch (err) {
-      console.error('Erro ao excluir:', err);
-    }
-  }
-
-  else if (data.startsWith('edit_tx_')) {
-    await bot.answerCallbackQuery(callbackQuery.id);
-    const txId = parseInt(data.split('_')[2]);
-    const txRes = await pool.query('SELECT * FROM transacoes WHERE id = $1 AND (telegram_id = $2 OR user_id = $2)', [txId, userId]);
-    if (txRes.rows.length === 0) return;
-    const tx = txRes.rows[0];
-    userStates.set(userId, { action: 'editing', txId: tx.id });
-
-    bot.sendMessage(userId, `✏️ *Editar Transação #${tx.id}*\n\nAtual: ${tx.tipo.toUpperCase()} | R$ ${tx.valor} | ${tx.descricao}\n\nEnvie os novos dados no formato: \`[tipo] [valor] [descrição]\``, { parse_mode: 'Markdown' });
-  }
-
-  // Aprovação ou Rejeição Administrativa
   else if (data.startsWith('aprovar_pag_') || data.startsWith('rejeitar_pag_')) {
     if (!ownerId || userId !== ownerId) {
       await bot.answerCallbackQuery(callbackQuery.id, { text: 'Acesso negado.', show_alert: true });
@@ -424,7 +563,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-// Recebimento de Comprovantes (Fotos ou Documentos)
+// Recebimento de Comprovantes (Fotos ou Documentos) e Notificação ao Admin
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
   if (ownerId && chatId === ownerId) return;
@@ -491,41 +630,33 @@ async function registrarEEnviarSolicitacao(msg, fileId, fileType) {
       }
     }
   } catch (err) {
-    console.error('Erro ao registrar:', err);
+    console.error('Erro ao registrar solicitação:', err);
     bot.sendMessage(chatId, '❌ Erro ao enviar comprovante.', mainReplyKeyboard);
   }
 }
 
-// Regex rápido para transações (Ganhei / Gastei / Investi direto por texto)
-bot.onText(/(ganhei|gastei|investi)\s+([0-9.,]+)(?:\s+(.*))?/i, async (msg, match) => {
-  if (userStates.has(msg.chat.id)) return;
-  await garantirUsuario(msg);
+// Comandos administrativos preservados
+bot.onText(/\/pagamentos/, async (msg) => {
   const chatId = msg.chat.id;
-  const tipoBruto = match[1].toLowerCase();
-  let tipo = 'gasto';
-  if (tipoBruto.startsWith('ganh')) tipo = 'ganho';
-  if (tipoBruto.startsWith('inv')) tipo = 'investimento';
-
-  const valorStr = match[2].replace(',', '.');
-  const valor = parseFloat(valorStr);
-  const descricao = match[3] || 'Sem descrição';
-
-  if (isNaN(valor) || valor <= 0) return;
+  if (!ownerId || chatId !== ownerId) return;
 
   try {
-    await pool.query(
-      'INSERT INTO transacoes (telegram_id, user_id, tipo, valor, descricao, data) VALUES ($1, $1, $2, $3, $4, NOW())',
-      [chatId, tipo, valor, descricao]
-    );
-
-    const emoji = tipo === 'ganho' ? '🟢' : tipo === 'investimento' ? '🔵' : '🔴';
-    bot.sendMessage(chatId, `${emoji} *Transação registrada!*\nTipo: *${tipo.toUpperCase()}*\nValor: *R$ ${valor.toFixed(2)}*\nDescrição: ${descricao}`, { parse_mode: 'Markdown', ...mainReplyKeyboard });
+    const res = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE status = 'PENDING' ORDER BY created_at ASC");
+    if (res.rows.length === 0) {
+      bot.sendMessage(chatId, '𭭢 Não há solicitações pendentes.');
+      return;
+    }
+    let text = '📋 *Solicitações Pendentes:*\n\n';
+    res.rows.forEach(r => {
+      text += `• ID: \`${r.id}\` | Usuário: ${r.username} (\`${r.telegram_id}\`)\n`;
+    });
+    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
   } catch (err) {
-    console.error('Erro:', err);
+    console.error(err);
   }
 });
 
-// Avisos automáticos de vencimento VIP
+// Avisos de vencimento automático
 async function verificarVencimentosAutomaticos() {
   try {
     const agora = new Date();
@@ -537,7 +668,7 @@ async function verificarVencimentosAutomaticos() {
       const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
       if (diffDays === 3) {
-        bot.sendMessage(user.telegram_id, `⚠️ *Aviso de Vencimento*\n\nSua assinatura do **Imperium Plus** vence em **3 dias** (${expDate.toLocaleDateString('pt-BR')}).`, { parse_mode: 'Markdown', ...mainReplyKeyboard })
+        bot.sendMessage(user.telegram_id, `⚠️ *Aviso de Vencimento*\n\nSua assinatura vence em **3 dias** (${expDate.toLocaleDateString('pt-BR')}).`, { parse_mode: 'Markdown', ...mainReplyKeyboard })
            .catch(() => {});
       } else if (diffDays === 0) {
         bot.sendMessage(user.telegram_id, `🚨 *Seu VIP vence hoje!*\n\nSua assinatura expira hoje (${expDate.toLocaleDateString('pt-BR')}).`, { parse_mode: 'Markdown', ...mainReplyKeyboard })
@@ -545,10 +676,10 @@ async function verificarVencimentosAutomaticos() {
       }
     }
   } catch (err) {
-    console.error('Erro na verificação:', err);
+    console.error(err);
   }
 }
 
 setInterval(verificarVencimentosAutomaticos, 12 * 60 * 60 * 1000);
 
-console.log('🤖 Bot Imperium Cash iniciado com sucesso!');
+console.log('🤖 Bot Imperium Cash restaurado e iniciado com sucesso!');
