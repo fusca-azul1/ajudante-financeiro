@@ -1,685 +1,1240 @@
 require('dotenv').config();
+
 const TelegramBot = require('node-telegram-bot-api');
-const { Pool } = require('pg');
 const express = require('express');
+const QuickChart = require('quickchart-js');
+const { Pool } = require('pg');
 const ExcelJS = require('exceljs');
+const fs = require('fs');
 
 const token = process.env.BOT_TOKEN;
-const ownerId = process.env.OWNER_ID ? Number(process.env.OWNER_ID) : null;
-const connectionString = process.env.DATABASE_URL;
+const OWNER_ID = String(process.env.OWNER_ID || '').trim();
 
-if (!token || !connectionString) {
-  console.error('ERRO CRÍTICO: BOT_TOKEN ou DATABASE_URL não configurados nas variáveis de ambiente.');
-  process.exit(1);
+if (!token) {
+    console.error("❌ BOT_TOKEN não configurado.");
+    process.exit(1);
 }
 
-const pool = new Pool({
-  connectionString,
-  ssl: { rejectUnauthorized: false }
-});
+if (!process.env.DATABASE_URL) {
+    console.error("❌ DATABASE_URL não configurado.");
+    process.exit(1);
+}
+
+if (!OWNER_ID) {
+    console.error("⚠️ OWNER_ID não configurado no .env.");
+}
 
 const bot = new TelegramBot(token, { polling: true });
-const app = express();
-const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => {
-  res.send('Imperium Cash Bot está rodando com sucesso!');
+// --- CONEXÃO COM BANCO ---
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor Express rodando na porta ${PORT}`);
+// --- VERIFICAR DONO ---
+function isOwner(userId) {
+    return OWNER_ID !== '' && String(userId).trim() === OWNER_ID;
+}
+
+// --- ERROS DO TELEGRAM ---
+bot.on('polling_error', (error) => {
+    console.error("❌ Erro no polling do Telegram:", error.message);
 });
 
-// Estados de conversas em memória (Fluxo original passo a passo + Edição + Comprovante)
-const userStates = new Map();
+// --- INICIALIZAÇÃO DO BANCO ---
+async function setupDB() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS usuarios (
+                telegram_id BIGINT PRIMARY KEY,
+                plano TEXT DEFAULT 'FREE',
+                username TEXT,
+                vip_expiracao TIMESTAMP,
+                data_cadastro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                origem TEXT DEFAULT 'organico'
+            );
+
+            ALTER TABLE usuarios
+            ADD COLUMN IF NOT EXISTS vip_expiracao TIMESTAMP;
+
+            ALTER TABLE usuarios
+            ADD COLUMN IF NOT EXISTS origem TEXT DEFAULT 'organico';
+
+            CREATE TABLE IF NOT EXISTS transacoes (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES usuarios(telegram_id),
+                tipo TEXT,
+                valor DECIMAL(12,2),
+                descricao TEXT,
+                data TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS pagamento_solicitacoes (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT,
+                username TEXT,
+                valor DECIMAL(12,2),
+                status TEXT DEFAULT 'PENDING',
+                telegram_file_id TEXT,
+                file_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TIMESTAMP,
+                reviewed_by BIGINT
+            );
+        `);
+
+        console.log("✅ Banco conectado: Gestão original, Imperium Plus e Edição ativados.");
+        console.log(`🔐 OWNER_ID configurado: ${OWNER_ID ? 'SIM' : 'NÃO'}`);
+    } catch (err) {
+        console.error("❌ Erro ao conectar ao banco:", err);
+    }
+}
+
+setupDB();
+
+const estados = {};
 const awaitingReceipt = new Set();
 
-// Teclado principal original restaurado com os dois novos botões solicitados: 💎 Assinar Imperium Plus e ✏️ Editar lançamento
-const mainReplyKeyboard = {
-  reply_markup: {
-    keyboard: [
-      ['💰 Ganhei', '💸 Gastei'],
-      ['📈 Investi', '📊 Análise'],
-      ['📜 Histórico', '👤 Minha Conta'],
-      ['💎 Assinar Imperium Plus', '✏️ Editar lançamento']
-    ],
-    resize_keyboard: true,
-    is_persistent: true
-  }
+// --- INTERFACE ORIGINAL + NOVOS BOTÕES ---
+const menuPrincipal = {
+    reply_markup: {
+        keyboard: [
+            ['💰 Ganhei', '💸 Gastei', '📈 Investi'],
+            ['📊 Análise', '📄 Histórico'],
+            ['👤 Minha Conta', '💎 Assinar Imperium Plus'],
+            ['✏️ Editar lançamento']
+        ],
+        resize_keyboard: true
+    }
 };
 
-// Função auxiliar para verificar acesso VIP
-async function verificarAcesso(telegramId) {
-  try {
-    const res = await pool.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [telegramId]);
-    if (res.rows.length === 0) return { plano: 'FREE', ativo: false };
-    
+const tecladoVoltar = {
+    reply_markup: {
+        keyboard: [['⬅️ Voltar']],
+        resize_keyboard: true
+    }
+};
+
+// --- FUNÇÃO DE ACESSO ---
+async function verificarAcesso(userId) {
+    const res = await pool.query(
+        'SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1',
+        [userId]
+    );
+
     const user = res.rows[0];
-    if (user.plano === 'VIP') {
-      if (user.vip_expiracao && new Date(user.vip_expiracao) > new Date()) {
-        return { plano: 'VIP', ativo: true, expiracao: user.vip_expiracao };
-      } else {
-        await pool.query("UPDATE usuarios SET plano = 'FREE', vip_expiracao = NULL WHERE telegram_id = $1", [telegramId]);
-        return { plano: 'FREE', ativo: false };
-      }
-    }
-    return { plano: 'FREE', ativo: false };
-  } catch (err) {
-    console.error('Erro ao verificar acesso:', err);
-    return { plano: 'FREE', ativo: false };
-  }
-}
+    let plano = user?.plano || 'FREE';
+    const expiracao = user?.vip_expiracao;
 
-// Garantir cadastro do usuário ao interagir
-async function garantirUsuario(msg) {
-  const chatId = msg.chat.id;
-  const user = msg.from;
-  const username = user.username ? `@${user.username}` : user.first_name || 'Usuário';
-  const origem = msg.text && msg.text.startsWith('/start ') ? msg.text.split(' ')[1] : 'direto';
+    if (plano === 'VIP') {
+        if (expiracao && new Date() > new Date(expiracao)) {
+            await pool.query(
+                "UPDATE usuarios SET plano = 'FREE', vip_expiracao = NULL WHERE telegram_id = $1",
+                [userId]
+            );
 
-  try {
-    const check = await pool.query('SELECT * FROM usuarios WHERE telegram_id = $1', [chatId]);
-    if (check.rows.length === 0) {
-      await pool.query(
-        'INSERT INTO usuarios (telegram_id, plano, username, data_cadastro, origem) VALUES ($1, $2, $3, NOW(), $4)',
-        [chatId, 'FREE', username, origem]
-      );
-    } else {
-      await pool.query('UPDATE usuarios SET username = $1 WHERE telegram_id = $2', [username, chatId]);
-    }
-  } catch (err) {
-    console.error('Erro ao garantir usuário:', err);
-  }
-}
-
-// Comando /start restaurado fielmente à mensagem inicial original
-bot.onText(/\/start/, async (msg) => {
-  await garantirUsuario(msg);
-  const chatId = msg.chat.id;
-  const welcomeText = `🚀 *Bem-vindo ao Imperium Cash!*\n\nO seu assistente financeiro pessoal inteligente.\n\nEscolha uma opção abaixo para começar:`;
-  bot.sendMessage(chatId, welcomeText, { parse_mode: 'Markdown', ...mainReplyKeyboard });
-});
-
-bot.onText(/\/meuid/, async (msg) => {
-  await garantirUsuario(msg);
-  bot.sendMessage(msg.chat.id, `🆔 Seu ID do Telegram é: \`${msg.chat.id}\``, { parse_mode: 'Markdown', ...mainReplyKeyboard });
-});
-
-bot.onText(/\/(clean|cls)/, (msg) => {
-  bot.sendMessage(msg.chat.id, '🧹 Para limpar o chat, utilize a opção do menu do seu aplicativo do Telegram.', mainReplyKeyboard);
-});
-
-// Máquina de Estados baseada em conversas passo a passo para Ganhei, Gastei, Investi e Edição
-bot.on('message', async (msg) => {
-  if (!msg.text || msg.text.startsWith('/')) return;
-  await garantirUsuario(msg);
-  const chatId = msg.chat.id;
-  const text = msg.text.trim();
-
-  if (text.toLowerCase() === 'cancelar') {
-    userStates.delete(chatId);
-    awaitingReceipt.delete(chatId);
-    bot.sendMessage(chatId, '❌ Operação cancelada.', mainReplyKeyboard);
-    return;
-  }
-
-  // 1. Tratamento dos botões do menu principal original
-  if (text === '💰 Ganhei') {
-    userStates.set(chatId, { step: 'ganho_valor' });
-    bot.sendMessage(chatId, 'Quanto você ganhou?', mainReplyKeyboard);
-    return;
-  }
-  if (text === '💸 Gastei') {
-    userStates.set(chatId, { step: 'gasto_valor' });
-    bot.sendMessage(chatId, 'Quanto você gastou?', mainReplyKeyboard);
-    return;
-  }
-  if (text === '📈 Investi') {
-    userStates.set(chatId, { step: 'investimento_valor' });
-    bot.sendMessage(chatId, 'Quanto você investiu?', mainReplyKeyboard);
-    return;
-  }
-
-  // 2. Apresentação original da Análise
-  if (text === '📊 Análise') {
-    try {
-      const res = await pool.query('SELECT tipo, SUM(valor) as total FROM transacoes WHERE telegram_id = $1 OR user_id = $1 GROUP BY tipo', [chatId]);
-      let ganhos = 0, gastos = 0, investimentos = 0;
-      res.rows.forEach(r => {
-        if (r.tipo === 'ganho') ganhos = Number(r.total);
-        if (r.tipo === 'gasto') gastos = Number(r.total);
-        if (r.tipo === 'investimento') investimentos = Number(r.total);
-      });
-      const saldo = ganhos - gastos - investimentos;
-      const analysisText = `📊 *Sua Análise Financeira*\n\n` +
-                           `🟢 Total Ganho: R$ ${ganhos.toFixed(2)}\n` +
-                           `🔴 Total Gasto: R$ ${gastos.toFixed(2)}\n` +
-                           `🔵 Total Investido: R$ ${investimentos.toFixed(2)}\n` +
-                           `💰 *Saldo Líquido:* R$ ${saldo.toFixed(2)}`;
-      bot.sendMessage(chatId, analysisText, { parse_mode: 'Markdown', ...mainReplyKeyboard });
-    } catch (err) {
-      console.error('Erro na análise:', err);
-      bot.sendMessage(chatId, '❌ Erro ao carregar análise.', mainReplyKeyboard);
-    }
-    return;
-  }
-
-  // 3. Apresentação original do Histórico (limpo e sem botões inline por lançamento)
-  if (text === '📜 Histórico') {
-    try {
-      const res = await pool.query('SELECT * FROM transacoes WHERE telegram_id = $1 OR user_id = $1 ORDER BY data DESC LIMIT 10', [chatId]);
-      if (res.rows.length === 0) {
-        bot.sendMessage(chatId, '📜 Nenhuma transação encontrada.', mainReplyKeyboard);
-        return;
-      }
-      let histText = '📜 *Suas Últimas 10 Transações:*\n\n';
-      res.rows.forEach((tx, idx) => {
-        const dataF = new Date(tx.data).toLocaleDateString('pt-BR');
-        const valorF = Number(tx.valor).toFixed(2);
-        const tipoEmoji = tx.tipo === 'ganho' ? '🟢' : tx.tipo === 'investimento' ? '🔵' : '🔴';
-        histText += `${idx + 1}. ${tipoEmoji} *${tx.tipo.toUpperCase()}* | R$ ${valorF} | ${tx.descricao} (${dataF})\n`;
-      });
-      bot.sendMessage(chatId, histText, { parse_mode: 'Markdown', ...mainReplyKeyboard });
-    } catch (err) {
-      console.error('Erro ao listar histórico:', err);
-      bot.sendMessage(chatId, '❌ Erro ao carregar histórico.', mainReplyKeyboard);
-    }
-    return;
-  }
-
-  if (text === '👤 Minha Conta') {
-    const statusVip = await verificarAcesso(chatId);
-    const userRes = await pool.query('SELECT * FROM usuarios WHERE telegram_id = $1', [chatId]);
-    const txCountRes = await pool.query('SELECT COUNT(*) FROM transacoes WHERE telegram_id = $1 OR user_id = $1', [chatId]);
-    const userData = userRes.rows[0];
-    const txCount = txCountRes.rows[0].count;
-
-    let vipInfo = 'Plano Atual: **FREE 🟢**\n• Tenha recursos avançados com o Imperium Plus.';
-    if (statusVip.ativo) {
-      const expDate = new Date(statusVip.expiracao).toLocaleDateString('pt-BR');
-      vipInfo = `Plano Atual: **VIP (Imperium Plus) 👑**\n📅 Vencimento: \`${expDate}\`\nStatus: Ativo`;
+            plano = 'FREE';
+        } else {
+            return {
+                pode: true,
+                plano: 'VIP'
+            };
+        }
     }
 
-    const contaText = `👤 *Minha Conta*\n\n` +
-                      `🆔 ID: \`${chatId}\`\n` +
-                      `🏷️ Username: ${userData.username || 'Não definido'}\n` +
-                      `${vipInfo}\n\n` +
-                      `📊 Total de Registros: \`${txCount}\`\n` +
-                      `📌 Origem: \`${userData.origem || 'direto'}\``;
-    bot.sendMessage(chatId, contaText, { parse_mode: 'Markdown', ...mainReplyKeyboard });
-    return;
-  }
-
-  // 4. Fluxo de Assinatura VIP
-  if (text === '💎 Assinar Imperium Plus') {
-    const pixKey = process.env.PIX_KEY;
-    const receiverName = process.env.PIX_RECEIVER_NAME;
-    const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
-    const statusVip = await verificarAcesso(chatId);
-
-    if (!pixKey || !receiverName) {
-      bot.sendMessage(chatId, '⚠️ O sistema de pagamentos via Pix está temporariamente indisponível.', mainReplyKeyboard);
-      return;
-    }
-
-    const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [chatId]);
-    if (pendRes.rows.length > 0) {
-      bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', mainReplyKeyboard);
-      return;
-    }
-
-    let infoVipAtivo = '';
-    if (statusVip.ativo) {
-      const expDate = new Date(statusVip.expiracao).toLocaleDateString('pt-BR');
-      infoVipAtivo = `\nℹ️ *Nota:* Você já é VIP até \`${expDate}\`. Pagamentos adicionais somarão 30 dias à validade atual!\n`;
-    }
-
-    const plusText = `💎 *Imperium Plus* — Assinatura Mensal\n\n` +
-                     `• *Preço:* R$ 5,00\n` +
-                     `• *Duração:* 30 dias de acesso VIP\n` +
-                     `• *Benefícios:* Gráficos avançados, exportação ilimitada de planilhas Excel e relatórios detalhados.\n` +
-                     `${infoVipAtivo}\n` +
-                     `📌 *Dados para Pagamento via Pix:*\n` +
-                     `• **Chave Pix:** \`${pixKey}\`\n` +
-                     `• **Nome:** ${receiverName}\n` +
-                     `• **Descrição:** ${description}\n\n` +
-                     `💳 *Como proceder:*\n` +
-                     `1. Faça um Pix no valor exato de **R$ 5,00**.\n` +
-                     `2. Clique no botão abaixo para confirmar e enviar o comprovante.`;
-
-    const inlineKeyboard = {
-      inline_keyboard: [
-        [{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }],
-        [{ text: '↩️ Cancelar', callback_data: 'cancelar_assinatura' }]
-      ]
+    return {
+        pode: true,
+        plano: 'FREE'
     };
+}
 
-    bot.sendMessage(chatId, plusText, { parse_mode: 'Markdown', reply_markup: inlineKeyboard });
-    return;
-  }
+// --- CONVERTER VALOR ---
+function parseValor(texto) {
+    let limpo = texto
+        .toLowerCase()
+        .replace('r$', '')
+        .replace(/\s/g, '')
+        .trim();
 
-  // 5. Novo botão: ✏️ Editar lançamento (Por conversa, sem botões embaixo do histórico)
-  if (text === '✏️ Editar lançamento') {
+    if (limpo.endsWith('k')) {
+        return parseFloat(
+            limpo.replace('k', '').replace(',', '.')
+        ) * 1000;
+    }
+
+    return parseFloat(
+        limpo.replace(/\./g, '').replace(',', '.')
+    );
+}
+
+// --- LÓGICA DO BOT ---
+bot.on('message', async (msg) => {
     try {
-      const res = await pool.query('SELECT * FROM transacoes WHERE telegram_id = $1 OR user_id = $1 ORDER BY data DESC LIMIT 10', [chatId]);
-      if (res.rows.length === 0) {
-        bot.sendMessage(chatId, '📜 Nenhuma transação encontrada para edição.', mainReplyKeyboard);
-        return;
-      }
-      let listText = 'Qual lançamento você deseja editar?\n\n';
-      const userTxList = [];
-      res.rows.forEach((tx, idx) => {
-        userTxList.push(tx);
-        const valorF = Number(tx.valor).toFixed(2);
-        listText += `${idx + 1}. ${tx.tipo.toUpperCase()} — R$ ${valorF} — ${tx.descricao}\n`;
-      });
-      userStates.set(chatId, { step: 'edit_select_tx', txList: userTxList });
-      bot.sendMessage(chatId, listText, mainReplyKeyboard);
-    } catch (err) {
-      console.error('Erro ao listar para edição:', err);
-      bot.sendMessage(chatId, '❌ Erro ao carregar lançamentos.', mainReplyKeyboard);
-    }
-    return;
-  }
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        const text = msg.text;
 
-  // Máquina de estados conversacional para Ganhei, Gastei, Investi e Edição
-  if (userStates.has(chatId)) {
-    const state = userStates.get(chatId);
+        if (!text) return;
 
-    // Fluxo Ganhei (Passo 1: Valor -> Passo 2: Descrição -> Passo 3: Confirmação)
-    if (state.step === 'ganho_valor') {
-      const valor = parseFloat(text.replace(',', '.'));
-      if (isNaN(valor) || valor <= 0) {
-        bot.sendMessage(chatId, '⚠️ Valor inválido. Informe um número válido:', mainReplyKeyboard);
-        return;
-      }
-      state.valor = valor;
-      state.step = 'ganho_desc';
-      bot.sendMessage(chatId, 'Como você ganhou esse dinheiro?', mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'ganho_desc') {
-      state.descricao = text;
-      state.step = 'ganho_conf';
-      bot.sendMessage(chatId, `Confirma o lançamento de R$ ${state.valor.toFixed(2)} referente a ${state.descricao}? Responda 'sim' ou 'não'.`, mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'ganho_conf') {
-      if (text.toLowerCase() === 'sim') {
-        try {
-          await pool.query(
-            'INSERT INTO transacoes (telegram_id, user_id, tipo, valor, descricao, data) VALUES ($1, $1, $2, $3, $4, NOW())',
-            [chatId, 'ganho', state.valor, state.descricao]
-          );
-          userStates.delete(chatId);
-          bot.sendMessage(chatId, '🟢 Transação registrada com sucesso!', mainReplyKeyboard);
-        } catch (err) {
-          console.error(err);
-          bot.sendMessage(chatId, '❌ Erro ao salvar transação.', mainReplyKeyboard);
+        // --- SISTEMA DE RASTREAMENTO ---
+        let origem = 'organico';
+
+        if (text.startsWith('/start ')) {
+            origem = text.split(' ')[1];
         }
-      } else {
-        userStates.delete(chatId);
-        bot.sendMessage(chatId, '❌ Lançamento cancelado.', mainReplyKeyboard);
-      }
-      return;
-    }
 
-    // Fluxo Gastei
-    if (state.step === 'gasto_valor') {
-      const valor = parseFloat(text.replace(',', '.'));
-      if (isNaN(valor) || valor <= 0) {
-        bot.sendMessage(chatId, '⚠️ Valor inválido. Informe um número válido:', mainReplyKeyboard);
-        return;
-      }
-      state.valor = valor;
-      state.step = 'gasto_desc';
-      bot.sendMessage(chatId, 'Com que você gastou esse dinheiro?', mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'gasto_desc') {
-      state.descricao = text;
-      state.step = 'gasto_conf';
-      bot.sendMessage(chatId, `Confirma o lançamento de R$ ${state.valor.toFixed(2)} referente a ${state.descricao}? Responda 'sim' ou 'não'.`, mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'gasto_conf') {
-      if (text.toLowerCase() === 'sim') {
-        try {
-          await pool.query(
-            'INSERT INTO transacoes (telegram_id, user_id, tipo, valor, descricao, data) VALUES ($1, $1, $2, $3, $4, NOW())',
-            [chatId, 'gasto', state.valor, state.descricao]
-          );
-          userStates.delete(chatId);
-          bot.sendMessage(chatId, '🔴 Transação registrada com sucesso!', mainReplyKeyboard);
-        } catch (err) {
-          console.error(err);
-          bot.sendMessage(chatId, '❌ Erro ao salvar transação.', mainReplyKeyboard);
+        await pool.query(
+            `INSERT INTO usuarios
+            (telegram_id, username, origem)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET username = $2`,
+            [
+                userId,
+                msg.from.username || 'Usuario',
+                origem
+            ]
+        );
+
+        // --- MOSTRAR MEU ID ---
+        if (text === '/meuid') {
+            return bot.sendMessage(
+                chatId,
+                `🆔 Seu ID do Telegram é:\n<code>${userId}</code>`,
+                {
+                    parse_mode: 'HTML'
+                }
+            );
         }
-      } else {
-        userStates.delete(chatId);
-        bot.sendMessage(chatId, '❌ Lançamento cancelado.', mainReplyKeyboard);
-      }
-      return;
-    }
 
-    // Fluxo Investi
-    if (state.step === 'investimento_valor') {
-      const valor = parseFloat(text.replace(',', '.'));
-      if (isNaN(valor) || valor <= 0) {
-        bot.sendMessage(chatId, '⚠️ Valor inválido. Informe um número válido:', mainReplyKeyboard);
-        return;
-      }
-      state.valor = valor;
-      state.step = 'investimento_desc';
-      bot.sendMessage(chatId, 'Onde você investiu esse dinheiro?', mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'investimento_desc') {
-      state.descricao = text;
-      state.step = 'investimento_conf';
-      bot.sendMessage(chatId, `Confirma o lançamento de R$ ${state.valor.toFixed(2)} referente a ${state.descricao}? Responda 'sim' ou 'não'.`, mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'investimento_conf') {
-      if (text.toLowerCase() === 'sim') {
-        try {
-          await pool.query(
-            'INSERT INTO transacoes (telegram_id, user_id, tipo, valor, descricao, data) VALUES ($1, $1, $2, $3, $4, NOW())',
-            [chatId, 'investimento', state.valor, state.descricao]
-          );
-          userStates.delete(chatId);
-          bot.sendMessage(chatId, '🔵 Transação registrada com sucesso!', mainReplyKeyboard);
-        } catch (err) {
-          console.error(err);
-          bot.sendMessage(chatId, '❌ Erro ao salvar transação.', mainReplyKeyboard);
-        }
-      } else {
-        userStates.delete(chatId);
-        bot.sendMessage(chatId, '❌ Lançamento cancelado.', mainReplyKeyboard);
-      }
-      return;
-    }
+        // --- COMANDO /CLEAN ---
+        if (text === '/clean') {
+            try {
+                await pool.query(
+                    "DELETE FROM transacoes WHERE user_id = $1",
+                    [userId]
+                );
 
-    // Fluxo de Edição por Conversa (Seguro por ID do usuário)
-    if (state.step === 'edit_select_tx') {
-      const index = parseInt(text) - 1;
-      if (isNaN(index) || !state.txList[index]) {
-        bot.sendMessage(chatId, '⚠️ Número inválido. Escolha um número válido da lista:', mainReplyKeyboard);
-        return;
-      }
-      state.selectedTx = state.txList[index];
-      state.step = 'edit_select_field';
-      bot.sendMessage(chatId, 'Qual informação deseja alterar? (Digite: Valor, Descrição, Tipo ou Data)', mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'edit_select_field') {
-      const field = text.toLowerCase();
-      if (!['valor', 'descrição', 'descricao', 'tipo', 'data'].includes(field)) {
-        bot.sendMessage(chatId, '⚠️ Opção inválida. Escolha entre: Valor, Descrição, Tipo ou Data', mainReplyKeyboard);
-        return;
-      }
-      state.fieldToEdit = field.replace('descricao', 'descrição');
-      state.step = 'edit_get_new_value';
-      bot.sendMessage(chatId, `Informe o novo valor para ${state.fieldToEdit}:`, mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'edit_get_new_value') {
-      state.newValue = text;
-      state.step = 'edit_confirm';
-      const oldVal = state.fieldToEdit === 'valor' ? `R$ ${Number(state.selectedTx.valor).toFixed(2)}` : state.selectedTx[state.fieldToEdit === 'descrição' ? 'descricao' : state.fieldToEdit];
-      bot.sendMessage(chatId, `Confirme a alteração de ${oldVal} para ${state.newValue}? Responda 'sim' ou 'não'.`, mainReplyKeyboard);
-      return;
-    }
-    if (state.step === 'edit_confirm') {
-      if (text.toLowerCase() === 'sim') {
-        try {
-          let queryField = 'descricao';
-          let valToSave = state.newValue;
+                return bot.sendMessage(
+                    chatId,
+                    "🗑️ <b>Histórico limpo!</b> Todos os seus registros foram apagados com sucesso.",
+                    {
+                        parse_mode: 'HTML'
+                    }
+                );
+            } catch (e) {
+                console.error("Erro no /clean:", e);
 
-          if (state.fieldToEdit === 'valor') {
-            queryField = 'valor';
-            valToSave = parseFloat(state.newValue.replace(',', '.'));
-            if (isNaN(valToSave) || valToSave <= 0) {
-              bot.sendMessage(chatId, '⚠️ Valor numérico inválido. Edição cancelada.', mainReplyKeyboard);
-              userStates.delete(chatId);
-              return;
+                return bot.sendMessage(
+                    chatId,
+                    "❌ Erro ao limpar histórico."
+                );
             }
-          } else if (state.fieldToEdit === 'tipo') {
-            queryField = 'tipo';
-            const t = state.newValue.toLowerCase();
-            if (t.includes('ganh')) valToSave = 'ganho';
-            else if (t.includes('inv')) valToSave = 'investimento';
-            else valToSave = 'gasto';
-          } else if (state.fieldToEdit === 'data') {
-            queryField = 'data';
-          }
-
-          await pool.query(
-            `UPDATE transacoes SET ${queryField} = $1 WHERE id = $2 AND (telegram_id = $3 OR user_id = $3)`,
-            [valToSave, state.selectedTx.id, chatId]
-          );
-          userStates.delete(chatId);
-          bot.sendMessage(chatId, '✅ Registro atualizado com sucesso!', mainReplyKeyboard);
-        } catch (err) {
-          console.error(err);
-          bot.sendMessage(chatId, '❌ Erro ao atualizar registro.', mainReplyKeyboard);
         }
-      } else {
-        userStates.delete(chatId);
-        bot.sendMessage(chatId, '❌ Edição cancelada.', mainReplyKeyboard);
-      }
-      return;
+
+        // --- COMANDO /CLS ---
+        if (text === '/cls') {
+
+            if (!isOwner(userId)) {
+                return bot.sendMessage(
+                    chatId,
+                    "❌ Apenas o dono pode utilizar este comando."
+                );
+            }
+
+            try {
+                await pool.query(
+                    "TRUNCATE TABLE transacoes, usuarios, pagamento_solicitacoes RESTART IDENTITY CASCADE;"
+                );
+
+                return bot.sendMessage(
+                    chatId,
+                    "⚠️ <b>BANCO DE DADOS TOTALMENTE ZERADO!</b>\nTodos os usuários, contas e registros financeiros foram apagados permanentemente.",
+                    {
+                        parse_mode: 'HTML'
+                    }
+                );
+
+            } catch (e) {
+                console.error("Erro no /cls:", e);
+
+                return bot.sendMessage(
+                    chatId,
+                    "❌ Erro ao limpar o banco de dados geral."
+                );
+            }
+        }
+
+        // --- /ADDVIP ---
+        if (text === '/addvip') {
+
+            if (!isOwner(userId)) {
+                return bot.sendMessage(
+                    chatId,
+                    "❌ Apenas o dono pode gerenciar assinaturas."
+                );
+            }
+
+            estados[userId] = {
+                acao: 'pedir_id_vip'
+            };
+
+            return bot.sendMessage(
+                chatId,
+                "👤 <b>Adicionar Imperium Plus</b>\n\nEnvie o <b>ID do usuário</b> que você deseja promover (30 dias):",
+                {
+                    parse_mode: 'HTML',
+                    ...tecladoVoltar
+                }
+            );
+        }
+
+        // --- /VIP E /VIPS ---
+        if (
+            text.startsWith('/vip ') ||
+            text === '/vips'
+        ) {
+
+            if (!isOwner(userId)) {
+                return bot.sendMessage(
+                    chatId,
+                    "❌ Apenas o dono pode gerenciar assinaturas."
+                );
+            }
+
+            if (text.startsWith('/vip ')) {
+                const idParaPromover = text
+                    .replace('/vip', '')
+                    .trim();
+
+                if (
+                    !idParaPromover ||
+                    isNaN(idParaPromover)
+                ) {
+                    return bot.sendMessage(
+                        chatId,
+                        "⚠️ Use: /vip ID"
+                    );
+                }
+
+                try {
+                    await pool.query(
+                        "UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1",
+                        [idParaPromover]
+                    );
+
+                    return bot.sendMessage(
+                        chatId,
+                        `⭐ ID <code>${idParaPromover}</code> promovido para Imperium Plus por 30 dias!`,
+                        {
+                            parse_mode: 'HTML'
+                        }
+                    );
+
+                } catch (e) {
+                    console.error("Erro no /vip:", e);
+
+                    return bot.sendMessage(
+                        chatId,
+                        "❌ Erro no banco."
+                    );
+                }
+            }
+
+            if (text === '/vips') {
+                try {
+                    const res = await pool.query(
+                        "SELECT telegram_id, username, vip_expiracao FROM usuarios WHERE plano = 'VIP' ORDER BY vip_expiracao ASC"
+                    );
+
+                    if (res.rowCount === 0) {
+                        return bot.sendMessage(
+                            chatId,
+                            "Nenhum usuário Imperium Plus ativo no momento."
+                        );
+                    }
+
+                    let lista = "📋 <b>CLIENTES IMPERIUM PLUS ATIVOS:</b>\n\n";
+
+                    res.rows.forEach(u => {
+                        const dataExp = u.vip_expiracao
+                            ? new Date(u.vip_expiracao).toLocaleDateString('pt-BR')
+                            : "Sem data";
+
+                        lista +=
+                            `👤 @${u.username || 'Sem User'} (<code>${u.telegram_id}</code>)\n` +
+                            `📅 Vence em: <b>${dataExp}</b>\n\n`;
+                    });
+
+                    return bot.sendMessage(
+                        chatId,
+                        lista,
+                        {
+                            parse_mode: 'HTML'
+                        }
+                    );
+
+                } catch (e) {
+                    console.error("Erro no /vips:", e);
+
+                    return bot.sendMessage(
+                        chatId,
+                        "❌ Erro ao consultar os usuários VIP."
+                    );
+                }
+            }
+        }
+
+        // --- PLANILHAS ---
+        if (
+            text === '/planilha_vip' ||
+            text === '/planilha_geral'
+        ) {
+
+            if (!isOwner(userId)) {
+                return bot.sendMessage(
+                    chatId,
+                    "❌ Apenas o dono pode exportar dados."
+                );
+            }
+
+            const queryStr =
+                text === '/planilha_geral'
+                    ? "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios"
+                    : "SELECT telegram_id, username, plano, vip_expiracao, data_cadastro, origem FROM usuarios WHERE plano = 'VIP'";
+
+            const nomeArquivo =
+                text === '/planilha_geral'
+                    ? 'Relatorio_Todos_Usuarios.xlsx'
+                    : 'Relatorio_Imperium_Plus.xlsx';
+
+            try {
+                const res = await pool.query(queryStr);
+                const workbook = new ExcelJS.Workbook();
+                const worksheet = workbook.addWorksheet('Clientes');
+
+                worksheet.columns = [
+                    { header: 'Telegram ID', key: 'id', width: 20 },
+                    { header: 'Username', key: 'user', width: 20 },
+                    { header: 'Plano', key: 'plano', width: 10 },
+                    { header: 'Origem (Parceiro)', key: 'origem', width: 20 },
+                    { header: 'Data Expiração', key: 'expira', width: 25 },
+                    { header: 'Cadastrado em', key: 'cadastro', width: 25 }
+                ];
+
+                res.rows.forEach(u => {
+                    worksheet.addRow({
+                        id: String(u.telegram_id),
+                        user: u.username || 'N/A',
+                        plano: u.plano,
+                        origem: u.origem || 'organico',
+                        expira: u.vip_expiracao ? new Date(u.vip_expiracao).toLocaleString('pt-BR') : '-',
+                        cadastro: u.data_cadastro ? new Date(u.data_cadastro).toLocaleString('pt-BR') : '-'
+                    });
+                });
+
+                const filePath = `./${nomeArquivo}`;
+                await workbook.xlsx.writeFile(filePath);
+
+                await bot.sendDocument(chatId, filePath, {
+                    caption: '📊 Planilha atualizada.'
+                });
+
+                if (fs.existsSync(filePath)) {
+                    fs.unlinkSync(filePath);
+                }
+
+                return;
+
+            } catch (e) {
+                console.error("Erro ao gerar planilha:", e);
+                return bot.sendMessage(chatId, "❌ Erro ao gerar a planilha.");
+            }
+        }
+
+        // --- COMANDO START (ORIGINAL RESTAURADO) ---
+        if (
+            text.startsWith('/start') ||
+            text === '⬅️ Voltar'
+        ) {
+            delete estados[userId];
+            awaitingReceipt.delete(userId);
+
+            const msgStart =
+                `👑 <b>Imperium Cash</b>\n\n` +
+                `Organize seu dinheiro de forma simples, rápida e sem complicação.\n\n` +
+                `Com o Imperium Cash você:\n` +
+                `• Registra ganhos, gastos e investimentos em segundos\n` +
+                `• Visualiza tudo com gráficos automáticos\n` +
+                `• Entende exatamente para onde seu dinheiro está indo\n\n` +
+                `━━━━━━━━━━━━━━━━━━\n\n` +
+                `💡 <b>Comece agora:</b>\n` +
+                `Escolha uma opção no menu abaixo e registre seu primeiro valor.`;
+
+            if (text.startsWith('/start')) {
+                try {
+                    return await bot.sendPhoto(
+                        chatId,
+                        './imperium_cash.jpg',
+                        {
+                            caption: msgStart,
+                            parse_mode: 'HTML',
+                            ...menuPrincipal
+                        }
+                    );
+                } catch (error) {
+                    return bot.sendMessage(
+                        chatId,
+                        msgStart,
+                        {
+                            parse_mode: 'HTML',
+                            ...menuPrincipal
+                        }
+                    );
+                }
+            }
+
+            return bot.sendMessage(
+                chatId,
+                msgStart,
+                {
+                    parse_mode: 'HTML',
+                    ...menuPrincipal
+                }
+            );
+        }
+
+        // --- MINHA CONTA ---
+        if (text === '👤 Minha Conta') {
+            try {
+                const res = await pool.query(
+                    'SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1',
+                    [userId]
+                );
+
+                const count = await pool.query(
+                    'SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1',
+                    [userId]
+                );
+
+                const user = res.rows[0];
+
+                let exp = "";
+                let nomePlano = 'Básico (Free)';
+
+                if (user?.plano === 'VIP') {
+                    nomePlano = '👑 Imperium Plus';
+
+                    if (user.vip_expiracao) {
+                        const d = new Date(user.vip_expiracao);
+                        const dia = String(d.getDate()).padStart(2, '0');
+                        const mes = String(d.getMonth() + 1).padStart(2, '0');
+                        const ano = d.getFullYear();
+
+                        exp = `\n\nSeu Imperium Plus expira dia (${dia}/${mes}/${ano})`;
+                    }
+                }
+
+                const mensagem =
+                    `👤 <b>Minha Conta</b>\n\n` +
+                    `ID: <code>${userId}</code>\n` +
+                    `Plano: <b>${nomePlano}</b>\n` +
+                    `Total de Registros: <b>${count.rows[0].total}</b>${exp}`;
+
+                return bot.sendMessage(
+                    chatId,
+                    mensagem,
+                    {
+                        parse_mode: 'HTML',
+                        ...menuPrincipal
+                    }
+                );
+
+            } catch (error) {
+                console.error("❌ Erro em Minha Conta:", error);
+                return bot.sendMessage(chatId, "❌ Não foi possível carregar os dados da sua conta.", menuPrincipal);
+            }
+        }
+
+        // --- ASSINAR IMPERIUM PLUS ---
+        if (text === '💎 Assinar Imperium Plus') {
+            const pixKey = process.env.PIX_KEY || 'Chave Pix não configurada';
+            const receiverName = process.env.PIX_RECEIVER_NAME || 'Administrador';
+            const description = process.env.PIX_PAYMENT_DESCRIPTION || 'Assinatura Imperium Plus';
+            const statusVip = await verificarAcesso(userId);
+
+            const pendRes = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE telegram_id = $1 AND status = 'PENDING'", [userId]);
+            if (pendRes.rows.length > 0) {
+                return bot.sendMessage(chatId, '⏳ Você já possui uma solicitação pendente aguardando análise administrativa.', menuPrincipal);
+            }
+
+            let infoVipAtivo = '';
+            if (statusVip.plano === 'VIP') {
+                infoVipAtivo = `\nℹ️ *Nota:* Você já possui assinatura ativa. Um novo pagamento estenderá seu VIP por mais 30 dias!\n`;
+            }
+
+            const plusText =
+                `💎 <b>Imperium Plus</b> — Assinatura Mensal\n\n` +
+                `• <b>Preço:</b> R$ 5,00\n` +
+                `• <b>Duração:</b> 30 dias de acesso VIP\n` +
+                `• <b>Benefícios:</b> Gráficos avançados, exportação ilimitada de relatórios e prioridade.\n` +
+                `${infoVipAtivo}\n` +
+                `📌 <b>Dados para Pagamento via Pix:</b>\n` +
+                `• Chave Pix: <code>${pixKey}</code>\n` +
+                `• Nome: ${receiverName}\n` +
+                `• Descrição: ${description}\n\n` +
+                `💳 <b>Como proceder:</b>\n` +
+                `1. Faça um Pix no valor exato de <b>R$ 5,00</b>.\n` +
+                `2. Clique no botão abaixo para enviar o seu comprovante.`;
+
+            const keyboardPlus = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '✅ Já realizei o pagamento', callback_data: 'enviar_comprovante_fluxo' }],
+                        [{ text: '❌ Cancelar', callback_data: 'cancelar_assinatura' }]
+                    ]
+                }
+            };
+
+            return bot.sendMessage(chatId, plusText, { parse_mode: 'HTML', ...keyboardPlus });
+        }
+
+        // --- EDITAR LANÇAMENTO (FLUXO CONVERSACIONAL) ---
+        if (text === '✏️ Editar lançamento') {
+            try {
+                const res = await pool.query('SELECT * FROM transacoes WHERE user_id = $1 ORDER BY data DESC LIMIT 10', [userId]);
+                if (res.rowCount === 0) {
+                    return bot.sendMessage(chatId, '📜 Nenhuma transação encontrada para edição.', menuPrincipal);
+                }
+
+                let listText = '✏️ <b>Qual lançamento você deseja editar?</b>\nEnvie o número correspondente:\n\n';
+                const userTxList = [];
+                res.rows.forEach((tx, idx) => {
+                    userTxList.push(tx);
+                    const valorF = Number(tx.valor).toFixed(2);
+                    const tipoFormatado = tx.tipo === 'entrada' ? 'Ganhei' : tx.tipo === 'saida' ? 'Gastei' : 'Investi';
+                    listText += `<b>${idx + 1}.</b> ${tipoFormatado} — R$ ${valorF} — ${tx.descricao}\n`;
+                });
+
+                estados[userId] = {
+                    acao: 'edit_select_tx',
+                    txList: userTxList
+                };
+
+                return bot.sendMessage(chatId, listText, { parse_mode: 'HTML', ...tecladoVoltar });
+            } catch (err) {
+                console.error('Erro ao listar para edição:', err);
+                return bot.sendMessage(chatId, '❌ Erro ao carregar lançamentos.', menuPrincipal);
+            }
+        }
+
+        const estado = estados[userId];
+
+        // --- MENU NORMAL / FLUXO PASSO A PASSO ORIGINAL ---
+        if (!estado) {
+
+            if (
+                text === '💸 Gastei' ||
+                text === '💰 Ganhei' ||
+                text === '📈 Investi'
+            ) {
+
+                const check = await verificarAcesso(userId);
+
+                if (!check.pode) {
+                    return bot.sendMessage(chatId, check.msg, { parse_mode: 'HTML' });
+                }
+
+                let tipo = 'saida';
+                let conversa = "Qual o valor que você gastou? (Ex: 50.00)";
+
+                if (text === '💰 Ganhei') {
+                    tipo = 'entrada';
+                    conversa = "Que ótimo! Qual foi o valor que você recebeu? (Ex: 150.50)";
+                } else if (text === '📈 Investi') {
+                    tipo = 'investimento';
+                    conversa = "📈 Hora de multiplicar! Quanto você investiu hoje? (Ex: 100.00)";
+                }
+
+                estados[userId] = {
+                    acao: 'pedir_valor',
+                    tipo: tipo
+                };
+
+                return bot.sendMessage(chatId, conversa, tecladoVoltar);
+            }
+
+            if (text === '📊 Análise') {
+                return enviarGraficoCompleto(chatId, userId);
+            }
+
+            if (text === '📄 Histórico') {
+                return enviarRelatorio(chatId, userId);
+            }
+
+            return bot.sendMessage(chatId, "🤖 Use o menu abaixo:", menuPrincipal);
+        }
+
+        // --- PEDIR ID VIP ---
+        if (estado.acao === 'pedir_id_vip') {
+            const idPromover = text.trim();
+
+            if (isNaN(idPromover)) {
+                return bot.sendMessage(
+                    chatId,
+                    "⚠️ O ID deve conter apenas números. Tente novamente ou use '⬅️ Voltar':",
+                    tecladoVoltar
+                );
+            }
+
+            try {
+                await pool.query(
+                    "UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1",
+                    [idPromover]
+                );
+
+                await bot.sendMessage(
+                    chatId,
+                    `⭐ Sucesso! O usuário de ID <code>${idPromover}</code> agora possui o Imperium Plus por 30 dias!`,
+                    {
+                        parse_mode: 'HTML',
+                        ...menuPrincipal
+                    }
+                );
+
+            } catch (e) {
+                console.error("Erro ao promover usuário:", e);
+                await bot.sendMessage(chatId, "❌ Erro ao promover usuário.", menuPrincipal);
+            }
+
+            delete estados[userId];
+            return;
+        }
+
+        // --- PEDIR VALOR (ORIGINAL) ---
+        if (estado.acao === 'pedir_valor') {
+            const v = parseValor(text);
+
+            if (isNaN(v)) {
+                return bot.sendMessage(chatId, "⚠️ Valor inválido. Digite apenas números.", tecladoVoltar);
+            }
+
+            estado.valor = v;
+            estado.acao = 'pedir_desc';
+
+            let msgDesc = "";
+
+            if (estado.tipo === 'entrada') {
+                msgDesc = "De onde veio esse dinheiro? (Ex: Salário, Venda de bolo, Pix do João)";
+            } else if (estado.tipo === 'saida') {
+                msgDesc = "Com o que você gastou? (Ex: Mercado, Conta de Luz, Lanche)";
+            } else if (estado.tipo === 'investimento') {
+                msgDesc = "Onde você aplicou esse valor? (Ex: Tesouro Direto, CDB Banco, Bitcoin)";
+            }
+
+            return bot.sendMessage(chatId, msgDesc, tecladoVoltar);
+        }
+
+        // --- PEDIR DESCRIÇÃO E SALVAR (ORIGINAL) ---
+        if (estado.acao === 'pedir_desc') {
+            await pool.query(
+                'INSERT INTO transacoes (user_id, tipo, valor, descricao) VALUES ($1, $2, $3, $4)',
+                [userId, estado.tipo, estado.valor, text]
+            );
+
+            const contagemQuery = await pool.query(
+                'SELECT COUNT(*) as total FROM transacoes WHERE user_id = $1',
+                [userId]
+            );
+
+            const totalRegistros = parseInt(contagemQuery.rows[0].total);
+
+            let emojiFinal = '🔴';
+            if (estado.tipo === 'entrada') emojiFinal = '🟢';
+            if (estado.tipo === 'investimento') emojiFinal = '📈';
+
+            await bot.sendMessage(
+                chatId,
+                `${emojiFinal} Tudo certo! Registro de <b>R$ ${estado.valor.toFixed(2)}</b> salvo com sucesso.\n\n` +
+                `🟢 +1 registro adicionado\n` +
+                `Você está no controle.\n` +
+                `📊 Progresso financeiro: ${totalRegistros} registros feitos.`,
+                {
+                    parse_mode: 'HTML',
+                    ...menuPrincipal
+                }
+            );
+
+            delete estados[userId];
+            return;
+        }
+
+        // --- MÁQUINA DE ESTADOS DA EDIÇÃO ---
+        if (estado.acao === 'edit_select_tx') {
+            const index = parseInt(text) - 1;
+            if (isNaN(index) || !estado.txList[index]) {
+                return bot.sendMessage(chatId, '⚠️ Número inválido. Escolha um número válido da lista:', tecladoVoltar);
+            }
+            estado.selectedTx = estado.txList[index];
+            estado.acao = 'edit_select_field';
+            return bot.sendMessage(chatId, 'Qual informação deseja corrigir? (Responda: Valor, Descrição, Tipo ou Data)', tecladoVoltar);
+        }
+
+        if (estado.acao === 'edit_select_field') {
+            const field = text.toLowerCase().trim();
+            if (!['valor', 'descrição', 'descricao', 'tipo', 'data'].includes(field)) {
+                return bot.sendMessage(chatId, '⚠️ Opção inválida. Escolha entre: Valor, Descrição, Tipo ou Data', tecladoVoltar);
+            }
+            estado.fieldToEdit = field.replace('descricao', 'descrição');
+            estado.acao = 'edit_get_new_value';
+            return bot.sendMessage(chatId, `Informe o novo valor para ${estado.fieldToEdit}:`, tecladoVoltar);
+        }
+
+        if (estado.acao === 'edit_get_new_value') {
+            estado.newValue = text;
+            estado.acao = 'edit_confirm';
+            let oldVal = `R$ ${Number(estado.selectedTx.valor).toFixed(2)}`;
+            if (estado.fieldToEdit === 'descrição') oldVal = estado.selectedTx.descricao;
+            if (estado.fieldToEdit === 'tipo') oldVal = estado.selectedTx.tipo;
+            if (estado.fieldToEdit === 'data') oldVal = new Date(estado.selectedTx.data).toLocaleDateString('pt-BR');
+
+            return bot.sendMessage(chatId, `Confirma a alteração de "${oldVal}" para "${estado.newValue}"? Responda 'sim' ou 'não'.`, tecladoVoltar);
+        }
+
+        if (estado.acao === 'edit_confirm') {
+            if (text.toLowerCase() === 'sim' || text.toLowerCase() === 's') {
+                try {
+                    let queryField = 'descricao';
+                    let valToSave = estado.newValue;
+
+                    if (estado.fieldToEdit === 'valor') {
+                        queryField = 'valor';
+                        valToSave = parseValor(estado.newValue);
+                        if (isNaN(valToSave) || valToSave <= 0) {
+                            delete estados[userId];
+                            return bot.sendMessage(chatId, '⚠️ Valor numérico inválido. Edição cancelada.', menuPrincipal);
+                        }
+                    } else if (estado.fieldToEdit === 'tipo') {
+                        queryField = 'tipo';
+                        const t = estado.newValue.toLowerCase();
+                        if (t.includes('ganh') || t.includes('entrada')) valToSave = 'entrada';
+                        else if (t.includes('inv')) valToSave = 'investimento';
+                        else valToSave = 'saida';
+                    } else if (estado.fieldToEdit === 'data') {
+                        queryField = 'data';
+                    }
+
+                    await pool.query(
+                        `UPDATE transacoes SET ${queryField} = $1 WHERE id = $2 AND user_id = $3`,
+                        [valToSave, estado.selectedTx.id, userId]
+                    );
+
+                    delete estados[userId];
+                    return bot.sendMessage(chatId, '✅ Lançamento atualizado com sucesso!', menuPrincipal);
+                } catch (err) {
+                    console.error('Erro ao atualizar transação:', err);
+                    delete estados[userId];
+                    return bot.sendMessage(chatId, '❌ Erro ao atualizar o registro no banco.', menuPrincipal);
+                }
+            } else {
+                delete estados[userId];
+                return bot.sendMessage(chatId, '❌ Edição cancelada.', menuPrincipal);
+            }
+        }
+
+    } catch (error) {
+        console.error("❌ Erro ao processar mensagem:", error);
+        try {
+            await bot.sendMessage(msg.chat.id, "❌ Ocorreu um erro ao processar sua solicitação. Tente novamente.", menuPrincipal);
+        } catch (sendError) {
+            console.error("❌ Erro ao enviar mensagem de erro:", sendError);
+        }
     }
-  }
 });
 
-// Tratamento de Callback Queries (Assinatura VIP e Painel do Administrador)
+// --- CALLBACK QUERIES (COMPROVANTES E ADMIN) ---
 bot.on('callback_query', async (callbackQuery) => {
-  const msg = callbackQuery.message;
-  const chatId = msg.chat.id;
-  const data = callbackQuery.data;
-  const userId = callbackQuery.from.id;
+    const msg = callbackQuery.message;
+    const chatId = msg.chat.id;
+    const data = callbackQuery.data;
+    const userId = callbackQuery.from.id;
 
-  await garantirUsuario({ chat: { id: userId }, from: callbackQuery.from });
-
-  if (data === 'enviar_comprovante_fluxo') {
-    awaitingReceipt.add(userId);
-    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Envie o comprovante!' });
-    bot.sendMessage(userId, '📥 *Envio de Comprovante*\n\nPor favor, envie agora a foto ou o arquivo PDF do seu comprovante de pagamento Pix.', { parse_mode: 'Markdown' });
-  }
-
-  else if (data === 'cancelar_assinatura') {
-    awaitingReceipt.delete(userId);
-    await bot.answerCallbackQuery(callbackQuery.id);
-    bot.sendMessage(userId, '❌ Processo de assinatura cancelado.', mainReplyKeyboard);
-  }
-
-  else if (data.startsWith('aprovar_pag_') || data.startsWith('rejeitar_pag_')) {
-    if (!ownerId || userId !== ownerId) {
-      await bot.answerCallbackQuery(callbackQuery.id, { text: 'Acesso negado.', show_alert: true });
-      return;
+    if (data === 'enviar_comprovante_fluxo') {
+        awaitingReceipt.add(userId);
+        await bot.answerCallbackQuery(callbackQuery.id, { text: 'Envie o comprovante!' });
+        return bot.sendMessage(userId, '📥 <b>Envio de Comprovante</b>\n\nPor favor, envie agora a foto ou o arquivo PDF do seu comprovante de pagamento Pix.', { parse_mode: 'HTML' });
     }
 
-    const parts = data.split('_');
-    const action = parts[0];
-    const reqId = parseInt(parts[2]);
-
-    try {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        const reqRes = await client.query('SELECT * FROM pagamento_solicitacoes WHERE id = $1 FOR UPDATE', [reqId]);
-        if (reqRes.rows.length === 0) {
-          await client.query('ROLLBACK');
-          await bot.answerCallbackQuery(callbackQuery.id, { text: 'Solicitação não encontrada.', show_alert: true });
-          return;
-        }
-
-        const solicitacao = reqRes.rows[0];
-        if (solicitacao.status !== 'PENDING') {
-          await client.query('ROLLBACK');
-          await bot.answerCallbackQuery(callbackQuery.id, { text: 'Já processada.', show_alert: true });
-          return;
-        }
-
-        if (action === 'aprovar') {
-          await client.query("UPDATE pagamento_solicitacoes SET status = 'APPROVED', reviewed_at = NOW(), reviewed_by = $1 WHERE id = $2", [userId, reqId]);
-
-          const userRes = await client.query('SELECT plano, vip_expiracao FROM usuarios WHERE telegram_id = $1', [solicitacao.telegram_id]);
-          let novaData;
-          const agora = new Date();
-          if (userRes.rows.length > 0 && userRes.rows[0].plano === 'VIP' && userRes.rows[0].vip_expiracao) {
-            const expAtual = new Date(userRes.rows[0].vip_expiracao);
-            novaData = expAtual > agora ? new Date(expAtual.getTime() + 30 * 24 * 60 * 60 * 1000) : new Date(agora.getTime() + 30 * 24 * 60 * 60 * 1000);
-          } else {
-            novaData = new Date(agora.getTime() + 30 * 24 * 60 * 60 * 1000);
-          }
-
-          await client.query("UPDATE usuarios SET plano = 'VIP', vip_expiracao = $1 WHERE telegram_id = $2", [novaData, solicitacao.telegram_id]);
-          await client.query('COMMIT');
-
-          await bot.answerCallbackQuery(callbackQuery.id, { text: 'Aprovado com sucesso!' });
-          bot.editMessageCaption(`✅ *SOLICITAÇÃO APROVADA*\nID: \`${reqId}\`\nCliente: ${solicitacao.username} (\`${solicitacao.telegram_id}\`)`, { parse_mode: 'Markdown' });
-
-          bot.sendMessage(solicitacao.telegram_id, `🎉 *Pagamento Aprovado!*\n\nSua assinatura do **Imperium Plus** foi ativada até \`${novaData.toLocaleDateString('pt-BR')}\`.`, { parse_mode: 'Markdown', ...mainReplyKeyboard });
-        } else if (action === 'rejeitar') {
-          await client.query("UPDATE pagamento_solicitacoes SET status = 'REJECTED', reviewed_at = NOW(), reviewed_by = $1 WHERE id = $2", [userId, reqId]);
-          await client.query('COMMIT');
-
-          await bot.answerCallbackQuery(callbackQuery.id, { text: 'Rejeitado.' });
-          bot.editMessageCaption(`❌ *SOLICITAÇÃO REJEITADA*\nID: \`${reqId}\`\nCliente: ${solicitacao.username} (\`${solicitacao.telegram_id}\`)`, { parse_mode: 'Markdown' });
-
-          bot.sendMessage(solicitacao.telegram_id, `⚠️ Seu comprovante do Imperium Plus não foi aprovado. Entre em contato com o suporte.`, { parse_mode: 'Markdown', ...mainReplyKeyboard });
-        }
-      } catch (err) {
-        await client.query('ROLLBACK');
-        console.error(err);
-      } finally {
-        client.release();
-      }
-    } catch (err) {
-      console.error(err);
+    if (data === 'cancelar_assinatura') {
+        awaitingReceipt.delete(userId);
+        await bot.answerCallbackQuery(callbackQuery.id);
+        return bot.sendMessage(userId, '❌ Processo de assinatura cancelado.', menuPrincipal);
     }
-  }
+
+    if (data.startsWith('aprovar_pag_') || data.startsWith('rejeitar_pag_')) {
+        if (!isOwner(userId)) {
+            return bot.answerCallbackQuery(callbackQuery.id, { text: 'Acesso negado.', show_alert: true });
+        }
+
+        const parts = data.split('_');
+        const action = parts[0];
+        const reqId = parseInt(parts[2]);
+
+        try {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                const reqRes = await client.query('SELECT * FROM pagamento_solicitacoes WHERE id = $1 FOR UPDATE', [reqId]);
+                if (reqRes.rowCount === 0) {
+                    await client.query('ROLLBACK');
+                    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Solicitação não encontrada.', show_alert: true });
+                    return;
+                }
+
+                const solicitacao = reqRes.rows[0];
+                if (solicitacao.status !== 'PENDING') {
+                    await client.query('ROLLBACK');
+                    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Já processada.', show_alert: true });
+                    return;
+                }
+
+                if (action === 'aprovar') {
+                    await client.query(
+                        "UPDATE pagamento_solicitacoes SET status = 'APPROVED', reviewed_at = NOW(), reviewed_by = $1 WHERE id = $2",
+                        [userId, reqId]
+                    );
+
+                    await client.query(
+                        "UPDATE usuarios SET plano = 'VIP', vip_expiracao = NOW() + INTERVAL '30 days' WHERE telegram_id = $1",
+                        [solicitacao.telegram_id]
+                    );
+
+                    await client.query('COMMIT');
+
+                    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Aprovado com sucesso!' });
+                    await bot.editMessageCaption(
+                        `✅ <b>SOLICITAÇÃO APROVADA</b>\nID: <code>${reqId}</code>\nCliente: ${solicitacao.username} (<code>${solicitacao.telegram_id}</code>)`,
+                        {
+                            chat_id: chatId,
+                            message_id: msg.message_id,
+                            parse_mode: 'HTML'
+                        }
+                    );
+
+                    await bot.sendMessage(
+                        solicitacao.telegram_id,
+                        `🎉 <b>Pagamento Aprovado!</b>\n\nSua assinatura do <b>Imperium Plus</b> foi ativada por 30 dias com sucesso!`,
+                        { parse_mode: 'HTML', ...menuPrincipal }
+                    );
+
+                } else if (action === 'rejeitar') {
+                    await client.query(
+                        "UPDATE pagamento_solicitacoes SET status = 'REJECTED', reviewed_at = NOW(), reviewed_by = $1 WHERE id = $2",
+                        [userId, reqId]
+                    );
+
+                    await client.query('COMMIT');
+
+                    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Rejeitado.' });
+                    await bot.editMessageCaption(
+                        `❌ <b>SOLICITAÇÃO REJEITADA</b>\nID: <code>${reqId}</code>\nCliente: ${solicitacao.username} (<code>${solicitacao.telegram_id}</code>)`,
+                        {
+                            chat_id: chatId,
+                            message_id: msg.message_id,
+                            parse_mode: 'HTML'
+                        }
+                    );
+
+                    await bot.sendMessage(
+                        solicitacao.telegram_id,
+                        `⚠️ Seu comprovante do Imperium Plus não foi aprovado. Verifique os dados do Pix ou entre em contato com o suporte.`,
+                        { parse_mode: 'HTML', ...menuPrincipal }
+                    );
+                }
+            } catch (err) {
+                await client.query('ROLLBACK');
+                console.error(err);
+            } finally {
+                client.release();
+            }
+        } catch (err) {
+            console.error(err);
+        }
+    }
 });
 
-// Recebimento de Comprovantes (Fotos ou Documentos) e Notificação ao Admin
+// --- RECEBIMENTO DE COMPROVANTES (FOTOS / DOCUMENTOS) ---
 bot.on('photo', async (msg) => {
-  const chatId = msg.chat.id;
-  if (ownerId && chatId === ownerId) return;
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    if (isOwner(userId)) return;
 
-  if (awaitingReceipt.has(chatId)) {
-    awaitingReceipt.delete(chatId);
-    const photo = msg.photo[msg.photo.length - 1];
-    await registrarEEnviarSolicitacao(msg, photo.file_id, 'photo');
-  }
+    if (awaitingReceipt.has(userId)) {
+        awaitingReceipt.delete(userId);
+        const photo = msg.photo[msg.photo.length - 1];
+        await registrarEEnviarSolicitacao(msg, photo.file_id, 'photo');
+    }
 });
 
 bot.on('document', async (msg) => {
-  const chatId = msg.chat.id;
-  if (ownerId && chatId === ownerId) return;
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    if (isOwner(userId)) return;
 
-  if (awaitingReceipt.has(chatId)) {
-    awaitingReceipt.delete(chatId);
-    const document = msg.document;
-    await registrarEEnviarSolicitacao(msg, document.file_id, 'document');
-  }
+    if (awaitingReceipt.has(userId)) {
+        awaitingReceipt.delete(userId);
+        const document = msg.document;
+        await registrarEEnviarSolicitacao(msg, document.file_id, 'document');
+    }
 });
 
 async function registrarEEnviarSolicitacao(msg, fileId, fileType) {
-  const chatId = msg.chat.id;
-  const user = msg.from;
-  const nomeCliente = user.first_name || 'Cliente';
-  const username = user.username ? `@${user.username}` : 'Não disponível';
+    const chatId = msg.chat.id;
+    const user = msg.from;
+    const nomeCliente = user.first_name || 'Cliente';
+    const username = user.username ? `@${user.username}` : 'Não disponível';
 
-  try {
-    const res = await pool.query(
-      `INSERT INTO pagamento_solicitacoes (telegram_id, username, valor, status, telegram_file_id, file_type, created_at)
-       VALUES ($1, $2, 5.00, 'PENDING', $3, $4, NOW()) RETURNING id`,
-      [chatId, username, fileId, fileType]
-    );
+    try {
+        const res = await pool.query(
+            `INSERT INTO pagamento_solicitacoes (telegram_id, username, valor, status, telegram_file_id, file_type, created_at)
+             VALUES ($1, $2, 5.00, 'PENDING', $3, $4, NOW()) RETURNING id`,
+            [chatId, username, fileId, fileType]
+        );
 
-    const reqId = res.rows[0].id;
-    const dataHoraEnvio = new Date().toLocaleString('pt-BR');
+        const reqId = res.rows[0].id;
+        const dataHoraEnvio = new Date().toLocaleString('pt-BR');
 
-    bot.sendMessage(chatId, '✅ *Comprovante recebido!*\n\nSua solicitação foi enviada para análise administrativa.', { parse_mode: 'Markdown', ...mainReplyKeyboard });
+        await bot.sendMessage(
+            chatId,
+            '✅ <b>Comprovante recebido!</b>\n\nSua solicitação foi enviada para análise administrativa. Você será avisado em breve.',
+            { parse_mode: 'HTML', ...menuPrincipal }
+        );
 
-    if (ownerId) {
-      const captionAdmin = `💰 *NOVA SOLICITAÇÃO DE ASSINATURA*\n\n` +
-                           `• **Nome do cliente:** ${nomeCliente}\n` +
-                           `• **Username do Telegram:** ${username}\n` +
-                           `• **ID numérico do cliente:** \`${chatId}\`\n` +
-                           `• **Plano solicitado:** Imperium Plus\n` +
-                           `• **Valor esperado:** R$ 5,00\n` +
-                           `• **ID único da solicitação:** \`${reqId}\`\n` +
-                           `• **Data e horário:** ${dataHoraEnvio}`;
+        if (OWNER_ID) {
+            const captionAdmin =
+                `💰 <b>NOVA SOLICITAÇÃO DE ASSINATURA</b>\n\n` +
+                `• <b>Nome do cliente:</b> ${nomeCliente}\n` +
+                `• <b>Username:</b> ${username}\n` +
+                `• <b>ID do cliente:</b> <code>${chatId}</code>\n` +
+                `• <b>Plano:</b> Imperium Plus\n` +
+                `• <b>Valor esperado:</b> R$ 5,00\n` +
+                `• <b>ID da solicitação:</b> <code>${reqId}</code>\n` +
+                `• <b>Data/Hora:</b> ${dataHoraEnvio}`;
 
-      const keyboardAdmin = {
-        inline_keyboard: [
-          [
-            { text: '✅ Aprovar pagamento', callback_data: `aprovar_pag_${reqId}` },
-            { text: '❌ Rejeitar pagamento', callback_data: `rejeitar_pag_${reqId}` }
-          ]
-        ]
-      };
+            const keyboardAdmin = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '✅ Aprovar pagamento', callback_data: `aprovar_pag_${reqId}` },
+                            { text: '❌ Rejeitar pagamento', callback_data: `rejeitar_pag_${reqId}` }
+                        ]
+                    ]
+                }
+            };
 
-      if (fileType === 'photo') {
-        await bot.sendPhoto(ownerId, fileId, { caption: captionAdmin, parse_mode: 'Markdown', reply_markup: keyboardAdmin });
-      } else {
-        await bot.sendDocument(ownerId, fileId, { caption: captionAdmin, parse_mode: 'Markdown', reply_markup: keyboardAdmin });
-      }
+            if (fileType === 'photo') {
+                await bot.sendPhoto(OWNER_ID, fileId, { caption: captionAdmin, parse_mode: 'HTML', ...keyboardAdmin });
+            } else {
+                await bot.sendDocument(OWNER_ID, fileId, { caption: captionAdmin, parse_mode: 'HTML', ...keyboardAdmin });
+            }
+        }
+    } catch (err) {
+        console.error('Erro ao registrar solicitação de pagamento:', err);
+        await bot.sendMessage(chatId, '❌ Ocorreu um erro ao enviar seu comprovante. Tente novamente mais tarde.', menuPrincipal);
     }
-  } catch (err) {
-    console.error('Erro ao registrar solicitação:', err);
-    bot.sendMessage(chatId, '❌ Erro ao enviar comprovante.', mainReplyKeyboard);
-  }
 }
 
-// Comandos administrativos preservados
+// --- COMANDO /PAGAMENTOS (ADMIN) ---
 bot.onText(/\/pagamentos/, async (msg) => {
-  const chatId = msg.chat.id;
-  if (!ownerId || chatId !== ownerId) return;
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    if (!isOwner(userId)) return;
 
-  try {
-    const res = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE status = 'PENDING' ORDER BY created_at ASC");
-    if (res.rows.length === 0) {
-      bot.sendMessage(chatId, '𭭢 Não há solicitações pendentes.');
-      return;
+    try {
+        const res = await pool.query("SELECT * FROM pagamento_solicitacoes WHERE status = 'PENDING' ORDER BY created_at ASC");
+        if (res.rowCount === 0) {
+            return bot.sendMessage(chatId, '𭭢 Não há solicitações de pagamento pendentes no momento.');
+        }
+
+        let text = '📋 <b>Solicitações Pendentes:</b>\n\n';
+        res.rows.forEach(r => {
+            const dataF = new Date(r.created_at).toLocaleString('pt-BR');
+            text += `• ID: <code>${r.id}</code> | User: ${r.username} (<code>${r.telegram_id}</code>) | Data: ${dataF}\n`;
+        });
+        return bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+    } catch (err) {
+        console.error(err);
     }
-    let text = '📋 *Solicitações Pendentes:*\n\n';
-    res.rows.forEach(r => {
-      text += `• ID: \`${r.id}\` | Usuário: ${r.username} (\`${r.telegram_id}\`)\n`;
-    });
-    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
-  } catch (err) {
-    console.error(err);
-  }
 });
 
-// Avisos de vencimento automático
-async function verificarVencimentosAutomaticos() {
-  try {
-    const agora = new Date();
-    const res = await pool.query("SELECT * FROM usuarios WHERE plano = 'VIP' AND vip_expiracao IS NOT NULL");
-    
-    for (const user of res.rows) {
-      const expDate = new Date(user.vip_expiracao);
-      const diffTime = expDate.getTime() - agora.getTime();
-      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+// --- GRÁFICO / ANÁLISE (ORIGINAL RESTAURADO) ---
+async function enviarGraficoCompleto(
+    chatId,
+    userId
+) {
+    try {
+        const res =
+            await pool.query(
+                "SELECT tipo, SUM(valor) as total FROM transacoes WHERE user_id = $1 GROUP BY tipo",
+                [userId]
+            );
 
-      if (diffDays === 3) {
-        bot.sendMessage(user.telegram_id, `⚠️ *Aviso de Vencimento*\n\nSua assinatura vence em **3 dias** (${expDate.toLocaleDateString('pt-BR')}).`, { parse_mode: 'Markdown', ...mainReplyKeyboard })
-           .catch(() => {});
-      } else if (diffDays === 0) {
-        bot.sendMessage(user.telegram_id, `🚨 *Seu VIP vence hoje!*\n\nSua assinatura expira hoje (${expDate.toLocaleDateString('pt-BR')}).`, { parse_mode: 'Markdown', ...mainReplyKeyboard })
-           .catch(() => {});
-      }
+        if (res.rowCount === 0) {
+            return bot.sendMessage(
+                chatId,
+                "Sem dados suficientes para gerar uma análise.",
+                menuPrincipal
+            );
+        }
+
+        let gn = 0;
+        let gs = 0;
+        let inv = 0;
+
+        res.rows.forEach(r => {
+            if (r.tipo === 'entrada') {
+                gn = parseFloat(r.total);
+            } else if (r.tipo === 'saida') {
+                gs = parseFloat(r.total);
+            } else if (r.tipo === 'investimento') {
+                inv = parseFloat(r.total);
+            }
+        });
+
+        const saldoDisponivel = gn - gs - inv;
+        const patrimonioTotal = saldoDisponivel + inv;
+
+        const chart = new QuickChart();
+
+        chart.setConfig({
+            type: 'doughnut',
+            data: {
+                labels: ['Ganhos', 'Gastos', 'Investimentos'],
+                datasets: [
+                    {
+                        data: [gn, gs, inv],
+                        backgroundColor: ['#2ecc71', '#e74c3c', '#3498db'],
+                        borderWidth: 2
+                    }
+                ]
+            },
+            options: {
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: { fontSize: 16 }
+                    }
+                }
+            }
+        })
+        .setWidth(500)
+        .setHeight(350);
+
+        const msgInfo =
+            `📊 <b>RESUMO FINANCEIRO DETALHADO</b>\n\n` +
+            `🟢 <b>Ganhos Totais:</b> R$ ${gn.toFixed(2)}\n` +
+            `🔴 <b>Gastos Totais:</b> R$ ${gs.toFixed(2)}\n` +
+            `📈 <b>Investimentos:</b> R$ ${inv.toFixed(2)}\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `💰 <b>Dinheiro Disponível (Conta):</b> R$ ${saldoDisponivel.toFixed(2)}\n` +
+            `🏦 <b>Patrimônio Total:</b> R$ ${patrimônioTotal.toFixed(2)}\n\n` +
+            `<i>*Seu Patrimônio Total é a soma do dinheiro na conta mais os seus investimentos.</i>`;
+
+        return bot.sendPhoto(
+            chatId,
+            await chart.getShortUrl(),
+            {
+                caption: msgInfo,
+                parse_mode: 'HTML',
+                ...menuPrincipal
+            }
+        );
+
+    } catch (error) {
+        console.error("❌ Erro na análise:", error);
+        return bot.sendMessage(chatId, "❌ Não foi possível gerar a análise financeira.", menuPrincipal);
     }
-  } catch (err) {
-    console.error(err);
-  }
 }
 
-setInterval(verificarVencimentosAutomaticos, 12 * 60 * 60 * 1000);
+// --- HISTÓRICO (ORIGINAL RESTAURADO, SEM BOTÕES ANEXADOS) ---
+async function enviarRelatorio(
+    chatId,
+    userId
+) {
+    try {
+        const res =
+            await pool.query(
+                "SELECT * FROM transacoes WHERE user_id = $1 ORDER BY data DESC LIMIT 15",
+                [userId]
+            );
 
-console.log('🤖 Bot Imperium Cash restaurado e iniciado com sucesso!');
+        if (res.rowCount === 0) {
+            return bot.sendMessage(
+                chatId,
+                "Seu histórico está vazio no momento.",
+                menuPrincipal
+            );
+        }
+
+        let m =
+            "📋 <b>SEUS ÚLTIMOS LANÇAMENTOS:</b>\n" +
+            "━━━━━━━━━━━━━━━━━━━━━━\n";
+
+        res.rows.forEach(t => {
+            let icone = '🔴';
+            if (t.tipo === 'entrada') icone = '🟢';
+            if (t.tipo === 'investimento') icone = '📈';
+
+            const d = new Date(t.data);
+            const dataFormatada =
+                `${String(d.getDate()).padStart(2, '0')}/` +
+                `${String(d.getMonth() + 1).padStart(2, '0')}`;
+
+            m +=
+                `${icone} <b>R$ ${parseFloat(t.valor).toFixed(2)}</b> - ` +
+                `${t.descricao} ` +
+                `<i>(${dataFormatada})</i>\n`;
+        });
+
+        m +=
+            "━━━━━━━━━━━━━━━━━━━━━━\n" +
+            "<i>Seu histórico financeiro está organizado aqui.</i>";
+
+        return bot.sendMessage(
+            chatId,
+            m,
+            {
+                parse_mode: 'HTML',
+                ...menuPrincipal
+            }
+        );
+
+    } catch (error) {
+        console.error("❌ Erro no histórico:", error);
+        return bot.sendMessage(chatId, "❌ Não foi possível carregar seu histórico.", menuPrincipal);
+    }
+}
+
+// --- SERVIDOR WEB ---
+const app = express();
+
+app.get('/', (req, res) => {
+    res.send('Bot Online - Gestão Premium Ativa');
+});
+
+app.listen(
+    process.env.PORT || 3000,
+    () => {
+        console.log(`🌐 Servidor online na porta ${process.env.PORT || 3000}`);
+    }
+);
+
+// --- PROTEÇÃO CONTRA ERROS ---
+process.on('unhandledRejection', (reason) => {
+    console.error("❌ Unhandled Rejection:", reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error("❌ Uncaught Exception:", error);
+});
